@@ -89,10 +89,6 @@ impl AgentSession {
     /// Invalidates remote focus after the native display geometry changes.
     #[must_use]
     pub fn reconcile_display(&mut self, display_size: Size) -> Vec<AgentAction> {
-        if self.display_size == display_size {
-            return Vec::new();
-        }
-
         self.display_size = display_size;
         self.active_focus_epoch = None;
         self.pending_batch = None;
@@ -447,6 +443,17 @@ mod tests {
                     [AgentAction::FocusEntered { .. }]
                 ))
         );
+    }
+
+    #[test]
+    fn display_change_with_the_same_bounds_still_invalidates_focus() {
+        let mut agent = focused_agent();
+
+        assert_eq!(
+            agent.reconcile_display(size(1920, 1080)),
+            vec![AgentAction::ReleaseAllInput]
+        );
+        assert_eq!(agent.active_focus_epoch(), None);
     }
 
     #[test]

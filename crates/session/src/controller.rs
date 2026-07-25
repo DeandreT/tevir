@@ -95,12 +95,15 @@ impl ControllerSession {
             return Ok(actions);
         }
 
+        let mut actions = Vec::new();
+        if self.buffer.is_full() && !self.buffer.can_coalesce(event) {
+            actions.extend(self.flush()?);
+        }
         self.observe_pointer(event)?;
         if self.buffer.push(event) {
-            self.flush()
-        } else {
-            Ok(Vec::new())
+            actions.extend(self.flush()?);
         }
+        Ok(actions)
     }
 
     pub fn flush(&mut self) -> Result<Vec<ControllerAction>, ControllerError> {
@@ -657,5 +660,57 @@ mod tests {
         ));
         assert_eq!(controller.acknowledge(&node("right"), 1), Ok(1));
         assert!(controller.flush().is_ok_and(|actions| actions.len() == 1));
+    }
+
+    #[test]
+    fn backpressure_never_grows_a_batch_past_the_protocol_limit() {
+        let mut controller = ControllerSession::new(topology(), node("left"))
+            .unwrap_or_else(|error| panic!("controller creation failed: {error}"));
+        controller
+            .activate(Edge::Right, 540)
+            .unwrap_or_else(|error| panic!("activation failed: {error}"));
+        for sequence in 0..MAX_PENDING_BATCHES_PER_PEER {
+            controller
+                .route_input(relative(sequence as u64, 1, 0))
+                .and_then(|_| controller.flush())
+                .unwrap_or_else(|error| panic!("batch {sequence} failed: {error}"));
+        }
+
+        for offset in 0..protocol::MAX_INPUT_EVENTS_PER_BATCH {
+            let result = controller.route_input(InputEvent {
+                elapsed_micros: 100 + offset as u64,
+                kind: InputKind::Key {
+                    key: PhysicalKey::new(0x07, 0x04),
+                    action: KeyAction::Press,
+                },
+            });
+            if offset + 1 == protocol::MAX_INPUT_EVENTS_PER_BATCH {
+                assert!(matches!(result, Err(ControllerError::Backpressure { .. })));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        assert!(matches!(
+            controller.route_input(InputEvent {
+                elapsed_micros: 1_000,
+                kind: InputKind::Key {
+                    key: PhysicalKey::new(0x07, 0x05),
+                    action: KeyAction::Press,
+                },
+            }),
+            Err(ControllerError::Backpressure { .. })
+        ));
+
+        assert_eq!(controller.acknowledge(&node("right"), 1), Ok(1));
+        let actions = controller
+            .flush()
+            .unwrap_or_else(|error| panic!("retained batch failed: {error}"));
+        assert!(matches!(
+            actions.as_slice(),
+            [ControllerAction::Send {
+                message: Session::Input(batch),
+                ..
+            }] if batch.events.len() == protocol::MAX_INPUT_EVENTS_PER_BATCH
+        ));
     }
 }

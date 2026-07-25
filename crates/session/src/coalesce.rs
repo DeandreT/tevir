@@ -7,7 +7,23 @@ pub(crate) struct EventBuffer {
 }
 
 impl EventBuffer {
+    pub(crate) fn can_coalesce(&self, event: InputEvent) -> bool {
+        self.events.last().is_some_and(|previous| {
+            matches!(
+                (previous.kind, event.kind),
+                (
+                    InputKind::PointerRelative { .. },
+                    InputKind::PointerRelative { .. }
+                ) | (InputKind::PointerAbsolute(_), InputKind::PointerAbsolute(_))
+            )
+        })
+    }
+
     pub(crate) fn push(&mut self, event: InputEvent) -> bool {
+        debug_assert!(
+            self.events.len() < MAX_INPUT_EVENTS_PER_BATCH || self.can_coalesce(event),
+            "a full input buffer must be flushed before accepting another transition"
+        );
         if let Some(previous) = self.events.last_mut() {
             match (&mut previous.kind, event.kind) {
                 (
@@ -44,6 +60,10 @@ impl EventBuffer {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.events.len() >= MAX_INPUT_EVENTS_PER_BATCH
     }
 }
 
