@@ -11,15 +11,16 @@
 
 ## 1. Native Input
 
-- Implement a Linux Wayland backend with XDG InputCapture and RemoteDesktop
+- [x] Implement a Linux Wayland backend with XDG InputCapture and RemoteDesktop
   portals plus EIS event transport.
-- Implement a Windows backend with a dedicated message loop, low-level input
+- [x] Implement a Windows backend with a dedicated message loop, low-level input
   hooks, and `SendInput`.
-- Normalize physical keys, high-resolution scrolling, button state, and display
+- [x] Normalize physical keys, high-resolution scrolling, button state, and display
   geometry into `domain` types.
-- Guarantee that focus loss, disconnect, and backend failure release every held
+- [x] Guarantee that focus loss, disconnect, and backend failure release every held
   key and button.
-- Add backend contract tests and isolated graphical smoke tests.
+- [x] Add backend contract tests. Graphical smoke coverage is part of the
+  desktop UI harness because portal sessions require an application window.
 
 ## 2. Secure Transport
 
@@ -54,4 +55,3 @@
 - Add tray status, reconnect controls, logs, and actionable permission errors.
 - Package user-session startup for Windows and Linux Wayland.
 - Add upgrade, recovery, soak, and end-to-end multi-node tests.
-

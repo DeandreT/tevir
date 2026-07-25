@@ -3,14 +3,20 @@
 //! Native event loops belong on dedicated threads. Implementations expose only
 //! the platform-neutral domain events defined by the `domain` crate.
 
+mod convert;
 #[cfg(target_os = "linux")]
 mod linux_wayland;
+mod service;
+mod state;
 #[cfg(target_os = "windows")]
 mod windows;
 
 pub use domain::HostPlatform;
-use domain::InputEvent;
 use serde::Serialize;
+pub use service::{
+    BackendKind, CaptureService, CaptureServiceEvent, InjectionService, InjectionServiceEvent,
+    SERVICE_QUEUE_CAPACITY,
+};
 use thiserror::Error;
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -18,8 +24,16 @@ compile_error!("Tevir supports only Windows and Linux Wayland");
 
 #[cfg(target_os = "linux")]
 pub use linux_wayland::probe_host;
+#[cfg(target_os = "linux")]
+use linux_wayland::{
+    native_capture_backend, native_capture_kind, native_emulation_backend, native_emulation_kind,
+};
 #[cfg(target_os = "windows")]
 pub use windows::probe_host;
+#[cfg(target_os = "windows")]
+use windows::{
+    native_capture_backend, native_capture_kind, native_emulation_backend, native_emulation_kind,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,22 +75,6 @@ impl std::fmt::Display for PlatformIssue {
     }
 }
 
-/// Captures local events after the routing layer activates this node.
-pub trait InputCapture: Send {
-    fn set_enabled(&mut self, enabled: bool) -> Result<(), BackendError>;
-    fn next_event(&mut self) -> Result<Option<InputEvent>, BackendError>;
-}
-
-/// Injects remote events and releases held state when focus changes or a peer disconnects.
-pub trait InputInjection: Send {
-    fn inject(&mut self, event: InputEvent) -> Result<(), BackendError>;
-    fn release_all(&mut self) -> Result<(), BackendError>;
-}
-
-pub trait InputBackend: InputCapture + InputInjection {}
-
-impl<T> InputBackend for T where T: InputCapture + InputInjection {}
-
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error("platform backend is unavailable: {reason}")]
@@ -88,4 +86,10 @@ pub enum BackendError {
         operation: &'static str,
         reason: String,
     },
+    #[error("backend command queue is full")]
+    CommandQueueFull,
+    #[error("backend worker has stopped")]
+    WorkerStopped,
+    #[error("backend worker thread panicked")]
+    WorkerPanicked,
 }

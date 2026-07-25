@@ -45,13 +45,13 @@ the receiving backend releases all held input before accepting a new epoch.
 
 ## Platform Boundaries
 
-Linux support is Wayland-only. Capture and injection will use desktop portals
-and EIS instead of compositor-specific protocols, privileged `/dev/input`
-access, or X11 compatibility.
+Linux support is Wayland-only. Capture and injection use desktop portals and
+EIS instead of compositor-specific protocols, privileged `/dev/input` access,
+or X11 compatibility.
 
-Windows capture and injection will use supported Win32 input facilities on a
-dedicated message-loop thread. Injected events must be identified so they
-cannot feed back into capture.
+Windows capture and injection use low-level hooks on a dedicated message-loop
+thread and `SendInput`. Native engines remain behind Tevir's bounded service
+queues and platform-neutral input model.
 
 ## Protocol
 
