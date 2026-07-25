@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use discovery::{DiscoveredNode, DiscoveryService, NearbyNodes};
 use domain::NodeId;
 use eframe::egui::{
     self, Align, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
@@ -10,6 +11,7 @@ use eframe::egui::{
 };
 use identity::{IdentityStore, LocalIdentity, PairingBundle, TrustStore};
 use platform::{EnvironmentStatus, PlatformReport};
+use protocol::Capabilities;
 use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
@@ -51,6 +53,9 @@ pub struct DesktopApp {
     settings: DesktopSettings,
     identity: Option<LocalIdentity>,
     trust: Option<TrustStore>,
+    discovery: Option<DiscoveryService>,
+    nearby: NearbyNodes,
+    discovery_error: Option<String>,
     page: Page,
     node_input: String,
     pairing_bundle_input: String,
@@ -91,7 +96,8 @@ impl DesktopApp {
             (None, None, None)
         };
 
-        Ok(Self {
+        let report = platform::probe_host();
+        let mut app = Self {
             data_directory,
             node_input: settings
                 .node
@@ -101,16 +107,21 @@ impl DesktopApp {
             settings,
             identity,
             trust,
+            discovery: None,
+            nearby: NearbyNodes::default(),
+            discovery_error: None,
             page: initial_page(),
             pairing_bundle_input: String::new(),
             pairing_code_input: String::new(),
             config_path_input: String::new(),
-            report: platform::probe_host(),
+            report,
             notice,
             config_summary: None,
             confirm_remove: None,
             logs,
-        })
+        };
+        app.start_discovery();
+        Ok(app)
     }
 
     fn create_identity(&mut self) {
@@ -132,6 +143,7 @@ impl DesktopApp {
                 }
                 self.identity = Some(identity);
                 self.trust = Some(trust);
+                self.start_discovery();
                 tracing::info!(node = %node, "local identity ready");
                 self.notice = Some(Notice::success("Local identity ready"));
             }
@@ -140,6 +152,46 @@ impl DesktopApp {
                 self.notice = Some(Notice::error(error));
             }
         }
+    }
+
+    fn start_discovery(&mut self) {
+        self.discovery = None;
+        self.nearby = NearbyNodes::default();
+        self.discovery_error = None;
+        let Some(identity) = self.identity.as_ref() else {
+            return;
+        };
+        match DiscoveryService::start(
+            identity.pairing_bundle(),
+            self.report.platform,
+            advertised_capabilities(),
+        ) {
+            Ok(discovery) => self.discovery = Some(discovery),
+            Err(error) => {
+                tracing::warn!(error = %error, "local network discovery unavailable");
+                self.discovery_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn poll_discovery(&mut self) {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return;
+        };
+        let result = discovery.poll(&mut self.nearby);
+        if let Some(error) = result.error {
+            self.discovery_error = Some(error);
+        }
+    }
+
+    fn select_discovered(&mut self, node: &DiscoveredNode) {
+        self.pairing_bundle_input = node.pairing_bundle().encode();
+        self.pairing_code_input.clear();
+        tracing::info!(peer = %node.node(), "nearby node selected for pairing");
+        self.notice = Some(Notice::info(format!(
+            "{} selected; verification required",
+            node.node()
+        )));
     }
 
     fn import_pairing(&mut self) {
@@ -368,6 +420,16 @@ impl DesktopApp {
                 WARNING
             },
         );
+        metric_row(
+            ui,
+            "Nearby nodes",
+            &self.nearby.len().to_string(),
+            if self.discovery.is_some() {
+                ACCENT
+            } else {
+                DANGER
+            },
+        );
         metric_row(ui, "Transport", "TLS 1.3 / QUIC", ACCENT);
 
         ui.add_space(30.0);
@@ -422,6 +484,69 @@ impl DesktopApp {
         });
 
         ui.add_space(30.0);
+        section_heading(ui, "Nearby nodes", &format!("{} found", self.nearby.len()));
+        ui.add_space(10.0);
+        if let Some(error) = self.discovery_error.as_ref() {
+            status_label(ui, error, DANGER);
+            ui.add_space(8.0);
+        }
+        let nearby = self.nearby.iter().cloned().collect::<Vec<_>>();
+        if nearby.is_empty() {
+            empty_state(
+                ui,
+                if self.discovery.is_some() {
+                    "Searching the local network"
+                } else {
+                    "Local network discovery unavailable"
+                },
+            );
+        }
+        for node in nearby {
+            let paired = self
+                .trust
+                .as_ref()
+                .is_some_and(|trust| trust.peers().any(|peer| peer.node() == node.node()));
+            let mut selected = false;
+            Frame::new()
+                .fill(ELEVATED)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(node.node().as_str()).strong().color(TEXT));
+                            ui.label(
+                                RichText::new(format_discovered_node(&node))
+                                    .family(FontFamily::Monospace)
+                                    .color(MUTED),
+                            );
+                            ui.label(
+                                RichText::new(format_fingerprint(node.fingerprint()))
+                                    .family(FontFamily::Monospace)
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !paired,
+                                    Button::new(if paired { "Paired" } else { "Pair" }),
+                                )
+                                .clicked()
+                            {
+                                selected = true;
+                            }
+                        });
+                    });
+                });
+            if selected {
+                self.select_discovered(&node);
+            }
+            ui.add_space(8.0);
+        }
+
+        ui.add_space(22.0);
         section_heading(
             ui,
             "Add trusted node",
@@ -603,6 +728,7 @@ impl DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.poll_discovery();
         if self.identity.is_none() {
             self.setup_view(ui);
             return;
@@ -610,9 +736,11 @@ impl eframe::App for DesktopApp {
         self.navigation(ui);
         self.top_bar(ui);
         self.content(ui);
-        if self.page == Page::Logs {
-            ui.ctx().request_repaint_after(Duration::from_millis(500));
-        }
+        ui.ctx().request_repaint_after(if self.page == Page::Logs {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(1)
+        });
     }
 }
 
@@ -807,6 +935,32 @@ fn format_fingerprint(fingerprint: [u8; 32]) -> String {
         .join("-")
 }
 
+fn format_discovered_node(node: &DiscoveredNode) -> String {
+    let platform = match node.platform() {
+        domain::HostPlatform::LinuxWayland => "Linux Wayland",
+        domain::HostPlatform::Windows => "Windows",
+    };
+    let addresses = node
+        .addresses()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        format!("{platform} | address pending")
+    } else {
+        format!("{platform} | {}", addresses.join(", "))
+    }
+}
+
+const fn advertised_capabilities() -> Capabilities {
+    Capabilities {
+        keyboard: true,
+        relative_pointer: true,
+        absolute_pointer: false,
+        clipboard_text: false,
+    }
+}
+
 #[cfg(feature = "screenshot-tests")]
 fn initial_page() -> Page {
     match std::env::var("TEVIR_SCREENSHOT_PAGE").as_deref() {
@@ -839,6 +993,13 @@ impl Notice {
         Self {
             message: message.into(),
             color: DANGER,
+        }
+    }
+
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            color: ACCENT,
         }
     }
 

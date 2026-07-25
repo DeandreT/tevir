@@ -8,6 +8,7 @@ the focused node.
 ## Workspace
 
 - `domain`: node identities, geometry, input events, and topology routing.
+- `discovery`: bounded local-network discovery for explicit peer pairing.
 - `identity`: persistent local credentials, pairing bundles, and trusted peers.
 - `protocol`: handshake/session messages and bounded Postcard framing.
 - `transport`: mutually authenticated QUIC sessions and isolated bulk streams.
@@ -35,9 +36,9 @@ cargo run -p tevir -- doctor
 cargo run -p tevir -- doctor --json
 ```
 
-The desktop control surface creates the local node identity, manages explicit
-peer pairing, validates configuration files, and reports native input
-prerequisites.
+The desktop control surface creates the local node identity, finds nearby nodes,
+manages explicit peer pairing, validates configuration files, and reports
+native input prerequisites.
 
 Validate one of the portable example configurations:
 

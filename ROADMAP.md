@@ -25,6 +25,7 @@
 ## 2. Secure Transport
 
 - [x] Add persistent node identities and an explicit local pairing flow.
+- [x] Discover nearby nodes with bounded DNS-SD records without granting trust.
 - [x] Establish mutually authenticated, encrypted sessions; plaintext input
   transport will not be supported.
 - [x] Separate control and bulk clipboard traffic so clipboard transfer cannot

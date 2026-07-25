@@ -15,7 +15,8 @@ behavior.
 ## Dependency Direction
 
 ```text
-tevir     -> domain, identity, platform, protocol, telemetry
+tevir     -> discovery, domain, identity, platform, protocol, telemetry
+discovery -> domain, identity, protocol
 transport -> domain, identity, protocol
 session   -> domain, protocol
 identity  -> domain
@@ -29,7 +30,14 @@ domain events without depending on networking. `identity` owns local
 credentials and explicit peer trust. `transport` owns authenticated QUIC
 connections, stream separation, and network deadlines. `session` owns the
 deterministic controller and agent state machines. The `tevir` executable owns
-configuration, process lifecycle, and session orchestration.
+configuration, process lifecycle, discovery polling, and session orchestration.
+
+`discovery` publishes and browses a DNS-SD service on the local network. Records
+carry the exact protocol version, platform, capabilities, certificate
+fingerprint, and a size-limited copy of the public pairing bundle. Received
+records are validated before entering a bounded nearby-node registry. Discovery
+never changes the trust store: pairing still requires the verification code
+from an independent channel.
 
 The desktop surface uses `eframe` and `egui`. Its pairing and validation
 actions call the same identity and configuration boundaries as non-graphical
