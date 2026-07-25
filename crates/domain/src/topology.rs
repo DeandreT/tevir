@@ -83,6 +83,18 @@ impl Topology {
         &self.screens
     }
 
+    #[must_use]
+    pub fn screen(&self, node: &NodeId) -> Option<&ScreenPlacement> {
+        self.screens.iter().find(|screen| &screen.node == node)
+    }
+
+    #[must_use]
+    pub fn screen_at(&self, point: Point) -> Option<&ScreenPlacement> {
+        self.screens
+            .iter()
+            .find(|screen| screen.bounds.contains(point))
+    }
+
     /// Finds the desktop entered through `edge` at an offset on the current edge.
     #[must_use]
     pub fn transition(&self, current: &NodeId, edge: Edge, offset: u32) -> Option<Transition<'_>> {
@@ -245,6 +257,28 @@ mod tests {
 
         assert_eq!(transition.target, &node("right"));
         assert_eq!(transition.local_position, Point { x: 0, y: 540 });
+    }
+
+    #[test]
+    fn routes_between_mixed_screens_at_negative_coordinates() {
+        let topology = Topology::new(vec![
+            screen("left", -2560, -360, 2560, 1440),
+            screen("right", 0, 0, 1920, 1080),
+        ])
+        .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
+
+        let transition = topology
+            .transition(&node("left"), Edge::Right, 900)
+            .unwrap_or_else(|| panic!("expected an adjacent screen"));
+
+        assert_eq!(transition.target, &node("right"));
+        assert_eq!(transition.local_position, Point { x: 0, y: 540 });
+        assert_eq!(
+            topology
+                .screen_at(Point { x: -1, y: 719 })
+                .map(|screen| &screen.node),
+            Some(&node("left"))
+        );
     }
 
     #[test]

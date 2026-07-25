@@ -4,6 +4,7 @@ members = [
     "crates/identity",
     "crates/platform",
     "crates/protocol",
+    "crates/session",
     "crates/tevir",
     "crates/transport",
 ]

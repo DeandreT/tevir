@@ -70,4 +70,14 @@ impl Rect {
             || ((self.top() == other.bottom() || self.bottom() == other.top())
                 && horizontal_overlap)
     }
+
+    #[must_use]
+    pub fn contains(self, point: Point) -> bool {
+        self.contains_coordinates(i64::from(point.x), i64::from(point.y))
+    }
+
+    #[must_use]
+    pub const fn contains_coordinates(self, x: i64, y: i64) -> bool {
+        x >= self.left() && x < self.right() && y >= self.top() && y < self.bottom()
+    }
 }
