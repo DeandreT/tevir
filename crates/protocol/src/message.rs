@@ -4,7 +4,9 @@ use domain::{HostPlatform, InputEvent, NodeId, Point};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+use crate::{ClipboardControl, ClipboardError};
+
+pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 pub const MAX_INPUT_EVENTS_PER_BATCH: usize = 512;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -107,6 +109,7 @@ pub enum Session {
     HeartbeatAcknowledged {
         nonce: u64,
     },
+    Clipboard(ClipboardControl),
     Disconnect,
 }
 
@@ -119,15 +122,26 @@ pub enum Envelope {
 
 impl Envelope {
     pub(crate) fn validate(&self) -> Result<(), MessageValidationError> {
-        if let Self::Session(Session::Input(batch)) = self {
-            if batch.events.is_empty() {
-                return Err(MessageValidationError::EmptyInputBatch);
-            }
-            if batch.events.len() > MAX_INPUT_EVENTS_PER_BATCH {
-                return Err(MessageValidationError::TooManyInputEvents {
-                    actual: batch.events.len(),
-                    maximum: MAX_INPUT_EVENTS_PER_BATCH,
-                });
+        if let Self::Session(message) = self {
+            match message {
+                Session::Input(batch) => {
+                    if batch.events.is_empty() {
+                        return Err(MessageValidationError::EmptyInputBatch);
+                    }
+                    if batch.events.len() > MAX_INPUT_EVENTS_PER_BATCH {
+                        return Err(MessageValidationError::TooManyInputEvents {
+                            actual: batch.events.len(),
+                            maximum: MAX_INPUT_EVENTS_PER_BATCH,
+                        });
+                    }
+                }
+                Session::Clipboard(ClipboardControl::Offered(offer)) => offer.validate()?,
+                Session::FocusChanged { .. }
+                | Session::InputAcknowledged { .. }
+                | Session::Heartbeat { .. }
+                | Session::HeartbeatAcknowledged { .. }
+                | Session::Clipboard(ClipboardControl::Applied { .. })
+                | Session::Disconnect => {}
             }
         }
 
@@ -141,6 +155,8 @@ pub enum MessageValidationError {
     EmptyInputBatch,
     #[error("input batch has {actual} events; the maximum is {maximum}")]
     TooManyInputEvents { actual: usize, maximum: usize },
+    #[error(transparent)]
+    InvalidClipboard(#[from] ClipboardError),
 }
 
 #[cfg(test)]
@@ -150,8 +166,8 @@ mod tests {
     #[test]
     fn compatibility_requires_the_exact_current_version() {
         assert!(CURRENT_PROTOCOL.is_current());
-        assert!(!ProtocolVersion { major: 1, minor: 1 }.is_current());
-        assert!(!ProtocolVersion { major: 0, minor: 9 }.is_current());
+        assert!(!ProtocolVersion { major: 1, minor: 2 }.is_current());
+        assert!(!ProtocolVersion { major: 1, minor: 0 }.is_current());
     }
 
     #[test]

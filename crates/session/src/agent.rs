@@ -1,5 +1,5 @@
 use domain::{NodeId, Point, Size};
-use protocol::{InputBatch, MAX_INPUT_EVENTS_PER_BATCH, Session};
+use protocol::{ClipboardControl, InputBatch, MAX_INPUT_EVENTS_PER_BATCH, Session};
 use thiserror::Error;
 
 pub struct AgentSession {
@@ -57,6 +57,7 @@ impl AgentSession {
                 })])
             }
             Session::HeartbeatAcknowledged { .. } => Ok(Vec::new()),
+            Session::Clipboard(control) => Ok(vec![AgentAction::Clipboard(control)]),
             Session::Disconnect => Ok(self.close()),
         }
     }
@@ -227,6 +228,7 @@ pub enum AgentAction {
     ApplyInput(InputBatch),
     ReleaseAllInput,
     Send(Session),
+    Clipboard(ClipboardControl),
     CloseConnection,
 }
 
