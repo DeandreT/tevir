@@ -24,7 +24,7 @@
 
 ## 2. Secure Transport
 
-- Add persistent node identities and an explicit local pairing flow.
+- [x] Add persistent node identities and an explicit local pairing flow.
 - Establish mutually authenticated, encrypted sessions; plaintext input
   transport will not be supported.
 - Separate control and bulk clipboard traffic so clipboard transfer cannot
