@@ -1,0 +1,17 @@
+[package]
+name = "platform"
+description = "Native input backend contracts and host probes for Tevir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

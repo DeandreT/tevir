@@ -1,0 +1,15 @@
+[package]
+name = "domain"
+description = "Platform-neutral domain types and screen routing for Tevir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

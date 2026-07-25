@@ -1,0 +1,19 @@
+[package]
+name = "protocol"
+description = "Versioned wire messages and framing for Tevir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+domain = { path = "../domain" }
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

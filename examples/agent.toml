@@ -1,0 +1,7 @@
+[node]
+id = "right-desk"
+
+[role]
+kind = "agent"
+controller = "192.0.2.10:24800"
+
