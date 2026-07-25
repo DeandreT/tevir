@@ -1,9 +1,12 @@
+mod app;
 mod config;
+mod settings;
 
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use config::{Config, Role};
+use domain::NodeId;
 use platform::{EnvironmentStatus, PlatformReport};
 use thiserror::Error;
 
@@ -11,11 +14,20 @@ use thiserror::Error;
 #[command(version, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the desktop control surface.
+    Ui {
+        /// Create or load this node identity.
+        #[arg(long)]
+        node: Option<String>,
+        /// Override the application data directory.
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
     /// Inspect native desktop-session prerequisites.
     Doctor {
         /// Emit a machine-readable report.
@@ -41,9 +53,20 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Command::Doctor { json } => doctor(json),
-        Command::Check { config } => check_config(&config),
+        None => open_ui(None, None),
+        Some(Command::Ui { node, data_dir }) => open_ui(node, data_dir),
+        Some(Command::Doctor { json }) => doctor(json),
+        Some(Command::Check { config }) => check_config(&config),
     }
+}
+
+fn open_ui(node: Option<String>, data_dir: Option<PathBuf>) -> Result<(), CliError> {
+    let node = node.map(NodeId::new).transpose()?;
+    let data_directory = data_dir
+        .map_or_else(settings::default_data_directory, Ok)
+        .map_err(app::AppError::from)?;
+    app::run(data_directory, node)?;
+    Ok(())
 }
 
 fn doctor(json: bool) -> Result<(), CliError> {
@@ -94,9 +117,13 @@ fn check_config(path: &std::path::Path) -> Result<(), CliError> {
 #[derive(Debug, Error)]
 enum CliError {
     #[error(transparent)]
+    App(#[from] app::AppError),
+    #[error(transparent)]
     Config(#[from] config::ConfigError),
     #[error("desktop-session prerequisites are not satisfied")]
     PlatformUnavailable,
     #[error("could not encode JSON report: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Node(#[from] domain::NodeIdError),
 }

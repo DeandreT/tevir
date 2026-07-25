@@ -50,7 +50,7 @@
 
 ## 5. Desktop Product
 
-- Add a native configuration and pairing UI backed by the same validated
+- [x] Add a native configuration and pairing UI backed by the same validated
   application commands as the CLI.
 - Add tray status, reconnect controls, logs, and actionable permission errors.
 - Package user-session startup for Windows and Linux Wayland.

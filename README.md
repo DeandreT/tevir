@@ -28,9 +28,14 @@ cargo build --workspace
 Inspect the current desktop session:
 
 ```sh
+cargo run -p tevir
 cargo run -p tevir -- doctor
 cargo run -p tevir -- doctor --json
 ```
+
+The desktop control surface creates the local node identity, manages explicit
+peer pairing, validates configuration files, and reports native input
+prerequisites.
 
 Validate one of the portable example configurations:
 

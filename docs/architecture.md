@@ -31,6 +31,10 @@ credentials and explicit peer trust. `transport` owns authenticated QUIC
 connections, stream separation, and network deadlines. The `tevir` executable
 owns configuration, process lifecycle, and session orchestration.
 
+The desktop surface uses `eframe` and `egui`. Its pairing and validation
+actions call the same identity and configuration boundaries as non-graphical
+commands. Linux builds enable only eframe's Wayland window backend.
+
 Native handles, portal objects, Windows messages, and operating-system key
 codes must remain inside `platform`. Wire DTOs must remain inside `protocol`.
 
