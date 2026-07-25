@@ -126,6 +126,7 @@ mod tests {
         Envelope::Handshake(Handshake::Hello(Hello {
             version: CURRENT_PROTOCOL,
             node,
+            nonce: [7; 32],
             platform: HostPlatform::LinuxWayland,
             capabilities: Capabilities {
                 keyboard: true,

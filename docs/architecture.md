@@ -15,18 +15,21 @@ behavior.
 ## Dependency Direction
 
 ```text
-domain <- protocol
-   ^         ^
-   |         |
-platform   tevir
-   ^         |
-   +---------+
+domain <- protocol <- transport
+   ^                    ^
+   |                    |
+platform              tevir
+                         ^
+                         |
+                     identity
 ```
 
 `domain` is deterministic and performs no I/O. `protocol` owns serialization,
 limits, and wire validation. `platform` translates native input to and from
-domain events without depending on networking. The `tevir` executable owns
-configuration, process lifecycle, and eventual session orchestration.
+domain events without depending on networking. `identity` owns local
+credentials and explicit peer trust. `transport` owns authenticated QUIC
+connections, stream separation, and network deadlines. The `tevir` executable
+owns configuration, process lifecycle, and session orchestration.
 
 Native handles, portal objects, Windows messages, and operating-system key
 codes must remain inside `platform`. Wire DTOs must remain inside `protocol`.
@@ -64,9 +67,17 @@ Protocol versions match exactly. Version mismatch is a handshake result, not a
 request to enter a legacy mode. The protocol does not reuse legacy messages or
 configuration.
 
-Framing is not security. Live sessions require an authenticated encrypted
-transport, persistent node identities, and explicit pairing. Authentication
-must complete before any input or clipboard message is accepted.
+Framing is not security. Each installation has a persistent private credential
+and exports only its trust anchor in a pairing bundle. Pairing requires an
+out-of-band fingerprint comparison before that anchor is stored.
+
+Live traffic uses TLS 1.3 over QUIC with certificates required from both
+parties. The certificate chain is bound to the claimed `NodeId` during an
+exact-version, nonce-bearing application handshake. Control messages use a
+high-priority bidirectional stream; bulk clipboard payloads use separate,
+lower-priority streams. Stream counts, flow-control windows, handshakes,
+frames, operation deadlines, idle timeouts, and reconnect attempts are all
+bounded.
 
 ## State And Backpressure
 

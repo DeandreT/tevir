@@ -45,6 +45,7 @@ impl Capabilities {
 pub struct Hello {
     pub version: ProtocolVersion,
     pub node: NodeId,
+    pub nonce: [u8; 32],
     pub platform: HostPlatform,
     pub capabilities: Capabilities,
     pub maximum_frame_bytes: NonZeroU32,
@@ -56,6 +57,7 @@ pub enum RejectReason {
     VersionMismatch,
     UnknownNode,
     AuthenticationFailed,
+    ReplayDetected,
     AlreadyConnected,
     PolicyDenied,
 }
@@ -67,7 +69,11 @@ pub enum Handshake {
     Accepted {
         session_id: u128,
         controller: NodeId,
+        client_nonce: [u8; 32],
+        server_nonce: [u8; 32],
+        platform: HostPlatform,
         negotiated_capabilities: Capabilities,
+        maximum_frame_bytes: NonZeroU32,
         heartbeat_interval_ms: NonZeroU32,
     },
     Rejected {

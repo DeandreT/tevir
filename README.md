@@ -8,8 +8,10 @@ the focused node.
 ## Workspace
 
 - `domain`: node identities, geometry, input events, and topology routing.
+- `identity`: persistent local credentials, pairing bundles, and trusted peers.
 - `protocol`: handshake/session messages and bounded Postcard framing.
-- `platform`: native backend traits and Windows/Wayland host probes.
+- `transport`: mutually authenticated QUIC sessions and isolated bulk streams.
+- `platform`: native input services and Windows/Wayland host probes.
 - `tevir`: the executable, validated TOML configuration, and diagnostics.
 
 ## Development

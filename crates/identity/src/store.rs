@@ -473,6 +473,7 @@ pub enum PeerFileError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
 
     use domain::NodeId;
