@@ -99,6 +99,20 @@ lower-priority streams. Stream counts, flow-control windows, handshakes,
 frames, operation deadlines, idle timeouts, and reconnect attempts are all
 bounded.
 
+## Clipboard
+
+Clipboard synchronization begins with bounded UTF-8 text. Each local change
+gets a generation containing its owner `NodeId` and a monotonic sequence. A
+small control offer carries the generation, byte length, and digest; the typed
+payload travels on a lower-priority clipboard stream and is verified against
+the offer before native application.
+
+Control and payload streams may arrive in either order. Each peer session keeps
+one native application in flight and at most one newer inbound generation;
+newer updates replace incomplete older ones. An applied message is emitted only
+after the platform confirms its write. The corresponding native change
+notification is suppressed so received content is not sent back to its owner.
+
 ## State And Backpressure
 
 The controller is the sole authority for focus epochs and topology. Each input

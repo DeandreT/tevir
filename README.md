@@ -12,7 +12,7 @@ the focused node.
 - `identity`: persistent local credentials, pairing bundles, and trusted peers.
 - `protocol`: handshake/session messages and bounded Postcard framing.
 - `transport`: mutually authenticated QUIC sessions and isolated bulk streams.
-- `session`: controller focus routing and ordered agent input delivery.
+- `session`: focus routing, ordered input delivery, and clipboard ownership.
 - `telemetry`: structured file, stderr, and desktop diagnostics.
 - `platform`: native input services and Windows/Wayland host probes.
 - `tevir`: the executable, validated TOML configuration, and diagnostics.

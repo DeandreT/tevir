@@ -8,7 +8,10 @@ use std::{
 
 use domain::{HostPlatform, NodeId};
 use identity::{LocalIdentity, TrustStore, TrustedPeer};
-use protocol::{CURRENT_PROTOCOL, Capabilities, Envelope, Handshake, Hello, RejectReason, Session};
+use protocol::{
+    CURRENT_PROTOCOL, Capabilities, ClipboardText, Envelope, Handshake, Hello, RejectReason,
+    Session,
+};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use rand::random;
 use rustls_pki_types::CertificateDer;
@@ -25,9 +28,9 @@ use crate::{
 
 const SERVER_NAME: &str = "tevir.local";
 const CONTROL_STREAM: u8 = 1;
-const BULK_STREAM: u8 = 2;
+const CLIPBOARD_STREAM: u8 = 2;
 const CONTROL_PRIORITY: i32 = 10;
-const BULK_PRIORITY: i32 = 0;
+const CLIPBOARD_PRIORITY: i32 = 0;
 const CLOSE_AUTHENTICATION: u32 = 1;
 const CLOSE_PROTOCOL: u32 = 2;
 const HEARTBEAT_INTERVAL_MS: u32 = 10_000;
@@ -201,7 +204,7 @@ impl SecureServer {
             send,
             receive,
             maximum_control_frame_bytes: maximum_frame_bytes,
-            maximum_bulk_frame_bytes: self.limits.maximum_bulk_frame_bytes(),
+            maximum_clipboard_frame_bytes: self.limits.maximum_clipboard_frame_bytes(),
             operation_timeout: self.limits.operation_timeout(),
         })
     }
@@ -359,7 +362,7 @@ impl SecureClient {
             send,
             receive,
             maximum_control_frame_bytes: negotiated_maximum,
-            maximum_bulk_frame_bytes: self.limits.maximum_bulk_frame_bytes(),
+            maximum_clipboard_frame_bytes: self.limits.maximum_clipboard_frame_bytes(),
             operation_timeout: self.limits.operation_timeout(),
         })
     }
@@ -371,7 +374,7 @@ pub struct PeerConnection {
     send: SendStream,
     receive: RecvStream,
     maximum_control_frame_bytes: usize,
-    maximum_bulk_frame_bytes: usize,
+    maximum_clipboard_frame_bytes: usize,
     operation_timeout: Duration,
 }
 
@@ -404,41 +407,45 @@ impl PeerConnection {
         }
     }
 
-    pub async fn open_bulk(&self) -> Result<BulkStream, TransportError> {
-        let (mut send, receive) = operation(self.operation_timeout, "opening bulk stream", async {
-            self.connection
-                .open_bi()
-                .await
-                .map_err(TransportError::Connection)
-        })
-        .await?;
-        send.set_priority(BULK_PRIORITY)
-            .map_err(|_| TransportError::StreamClosed)?;
-        write_stream_kind(&mut send, BULK_STREAM, self.operation_timeout).await?;
-        Ok(BulkStream {
-            send,
-            receive,
-            maximum_frame_bytes: self.maximum_bulk_frame_bytes,
-            operation_timeout: self.operation_timeout,
-        })
-    }
-
-    pub async fn accept_bulk(&self) -> Result<BulkStream, TransportError> {
-        let (send, mut receive) =
-            operation(self.operation_timeout, "accepting bulk stream", async {
+    pub async fn open_clipboard(&self) -> Result<ClipboardStream, TransportError> {
+        let (mut send, receive) =
+            operation(self.operation_timeout, "opening clipboard stream", async {
                 self.connection
-                    .accept_bi()
+                    .open_bi()
                     .await
                     .map_err(TransportError::Connection)
             })
             .await?;
-        expect_stream_kind(&mut receive, BULK_STREAM, self.operation_timeout).await?;
-        send.set_priority(BULK_PRIORITY)
+        send.set_priority(CLIPBOARD_PRIORITY)
             .map_err(|_| TransportError::StreamClosed)?;
-        Ok(BulkStream {
+        write_stream_kind(&mut send, CLIPBOARD_STREAM, self.operation_timeout).await?;
+        Ok(ClipboardStream {
             send,
             receive,
-            maximum_frame_bytes: self.maximum_bulk_frame_bytes,
+            maximum_frame_bytes: self.maximum_clipboard_frame_bytes,
+            operation_timeout: self.operation_timeout,
+        })
+    }
+
+    pub async fn accept_clipboard(&self) -> Result<ClipboardStream, TransportError> {
+        let (send, mut receive) = operation(
+            self.operation_timeout,
+            "accepting clipboard stream",
+            async {
+                self.connection
+                    .accept_bi()
+                    .await
+                    .map_err(TransportError::Connection)
+            },
+        )
+        .await?;
+        expect_stream_kind(&mut receive, CLIPBOARD_STREAM, self.operation_timeout).await?;
+        send.set_priority(CLIPBOARD_PRIORITY)
+            .map_err(|_| TransportError::StreamClosed)?;
+        Ok(ClipboardStream {
+            send,
+            receive,
+            maximum_frame_bytes: self.maximum_clipboard_frame_bytes,
             operation_timeout: self.operation_timeout,
         })
     }
@@ -461,30 +468,32 @@ pub struct ConnectionInfo {
     pub peer_platform: HostPlatform,
 }
 
-pub struct BulkStream {
+pub struct ClipboardStream {
     send: SendStream,
     receive: RecvStream,
     maximum_frame_bytes: usize,
     operation_timeout: Duration,
 }
 
-impl BulkStream {
-    pub async fn send(&mut self, payload: &[u8]) -> Result<(), TransportError> {
-        operation(self.operation_timeout, "writing bulk frame", async {
-            write_bulk(&mut self.send, payload, self.maximum_frame_bytes)
+impl ClipboardStream {
+    pub async fn send(&mut self, transfer: &ClipboardText) -> Result<(), TransportError> {
+        let payload = transfer.encode()?;
+        operation(self.operation_timeout, "writing clipboard frame", async {
+            write_bulk(&mut self.send, &payload, self.maximum_frame_bytes)
                 .await
                 .map_err(TransportError::Frame)
         })
         .await
     }
 
-    pub async fn receive(&mut self) -> Result<Vec<u8>, TransportError> {
-        operation(self.operation_timeout, "reading bulk frame", async {
+    pub async fn receive(&mut self) -> Result<ClipboardText, TransportError> {
+        let payload = operation(self.operation_timeout, "reading clipboard frame", async {
             read_bulk(&mut self.receive, self.maximum_frame_bytes)
                 .await
                 .map_err(TransportError::Frame)
         })
-        .await
+        .await?;
+        ClipboardText::decode(&payload).map_err(TransportError::Clipboard)
     }
 
     pub fn finish(&mut self) -> Result<(), TransportError> {
@@ -622,6 +631,8 @@ pub enum TransportError {
     TimedOut(&'static str),
     #[error(transparent)]
     Frame(#[from] FrameError),
+    #[error(transparent)]
+    Clipboard(#[from] protocol::ClipboardError),
     #[error("peer did not present a certificate")]
     MissingPeerCertificate,
     #[error("peer identity has an unsupported representation")]
@@ -659,11 +670,14 @@ pub enum TransportError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        num::NonZeroU64,
+    };
 
     use domain::NodeId;
     use identity::{IdentityStore, LocalIdentity, TrustStore};
-    use protocol::{Capabilities, HostPlatform, Session};
+    use protocol::{Capabilities, ClipboardGeneration, ClipboardText, HostPlatform, Session};
     use tempfile::TempDir;
 
     use super::{SecureClient, SecureServer, SessionLimits, SessionProfile, TransportError};
@@ -744,7 +758,7 @@ mod tests {
     use super::PeerConnection;
 
     #[tokio::test]
-    async fn exchanges_control_and_bulk_on_separate_streams() {
+    async fn exchanges_control_and_clipboard_on_separate_streams() {
         let (mut server_connection, mut client_connection) = connected_pair().await;
         client_connection
             .send(Session::Heartbeat { nonce: 42 })
@@ -758,24 +772,29 @@ mod tests {
             Ok(true)
         ));
 
-        let (server_bulk, client_bulk) = tokio::join!(
-            server_connection.accept_bulk(),
-            client_connection.open_bulk()
+        let (server_clipboard, client_clipboard) = tokio::join!(
+            server_connection.accept_clipboard(),
+            client_connection.open_clipboard()
         );
-        let mut server_bulk =
-            server_bulk.unwrap_or_else(|error| panic!("bulk accept failed: {error}"));
-        let mut client_bulk =
-            client_bulk.unwrap_or_else(|error| panic!("bulk open failed: {error}"));
-        client_bulk
-            .send(b"clipboard payload")
+        let mut server_clipboard =
+            server_clipboard.unwrap_or_else(|error| panic!("clipboard accept failed: {error}"));
+        let mut client_clipboard =
+            client_clipboard.unwrap_or_else(|error| panic!("clipboard open failed: {error}"));
+        let transfer = ClipboardText::new(
+            ClipboardGeneration::new(node("right"), NonZeroU64::new(1).unwrap_or(NonZeroU64::MIN)),
+            "clipboard payload",
+        )
+        .unwrap_or_else(|error| panic!("clipboard payload failed: {error}"));
+        client_clipboard
+            .send(&transfer)
             .await
-            .unwrap_or_else(|error| panic!("bulk send failed: {error}"));
+            .unwrap_or_else(|error| panic!("clipboard send failed: {error}"));
         assert_eq!(
-            server_bulk
+            server_clipboard
                 .receive()
                 .await
-                .unwrap_or_else(|error| panic!("bulk receive failed: {error}")),
-            b"clipboard payload"
+                .unwrap_or_else(|error| panic!("clipboard receive failed: {error}")),
+            transfer
         );
     }
 

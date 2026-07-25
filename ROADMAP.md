@@ -44,8 +44,8 @@
 
 ## 4. Clipboard
 
-- Begin with bounded UTF-8 text clipboard transfer.
-- Add ownership generations to prevent clipboard feedback loops.
+- [x] Begin with bounded UTF-8 text clipboard transfer.
+- [x] Add ownership generations to prevent clipboard feedback loops.
 - Keep platform-native clipboard formats out of the protocol.
 - Evaluate additional MIME types independently after text transfer is hardened.
 

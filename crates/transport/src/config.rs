@@ -4,11 +4,10 @@ use std::{
     time::Duration,
 };
 
-use protocol::{DEFAULT_MAX_FRAME_BYTES, HARD_MAX_FRAME_BYTES};
+use protocol::{DEFAULT_MAX_FRAME_BYTES, HARD_MAX_FRAME_BYTES, MAX_CLIPBOARD_FRAME_BYTES};
 use quinn::{IdleTimeout, TransportConfig, VarInt};
 use thiserror::Error;
 
-const DEFAULT_MAX_BULK_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_BIDI_STREAMS: u32 = 9;
 const STREAM_RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
@@ -20,7 +19,7 @@ pub struct SessionLimits {
     idle_timeout: Duration,
     keep_alive_interval: Duration,
     maximum_control_frame_bytes: NonZeroUsize,
-    maximum_bulk_frame_bytes: NonZeroUsize,
+    maximum_clipboard_frame_bytes: NonZeroUsize,
     maximum_bidirectional_streams: NonZeroU32,
 }
 
@@ -41,8 +40,8 @@ impl SessionLimits {
     }
 
     #[must_use]
-    pub fn maximum_bulk_frame_bytes(&self) -> usize {
-        self.maximum_bulk_frame_bytes.get()
+    pub fn maximum_clipboard_frame_bytes(&self) -> usize {
+        self.maximum_clipboard_frame_bytes.get()
     }
 
     pub(crate) fn transport_config(&self) -> Result<Arc<TransportConfig>, LimitsError> {
@@ -72,7 +71,7 @@ impl Default for SessionLimits {
             keep_alive_interval: Duration::from_secs(10),
             maximum_control_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES)
                 .unwrap_or(NonZeroUsize::MIN),
-            maximum_bulk_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_BULK_FRAME_BYTES)
+            maximum_clipboard_frame_bytes: NonZeroUsize::new(MAX_CLIPBOARD_FRAME_BYTES)
                 .unwrap_or(NonZeroUsize::MIN),
             maximum_bidirectional_streams: NonZeroU32::new(DEFAULT_MAX_BIDI_STREAMS)
                 .unwrap_or(NonZeroU32::MIN),
