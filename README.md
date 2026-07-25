@@ -38,8 +38,8 @@ cargo run -p tevir -- doctor --json
 ```
 
 The desktop control surface creates the local node identity, finds nearby nodes,
-manages explicit peer pairing, validates configuration files, and reports
-native input prerequisites.
+manages explicit peer pairing, creates validated controller or agent
+configurations, and reports native input prerequisites.
 
 Validate one of the portable example configurations:
 

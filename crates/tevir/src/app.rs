@@ -1,10 +1,12 @@
 use std::{
+    net::SocketAddr,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use discovery::{DiscoveredNode, DiscoveryService, NearbyNodes};
-use domain::NodeId;
+use domain::{NodeId, Point, Rect, ScreenPlacement, Size, Topology};
 use eframe::egui::{
     self, Align, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
     RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportBuilder,
@@ -34,14 +36,16 @@ const BORDER: Color32 = Color32::from_rgb(58, 63, 62);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Page {
     Status,
+    Configuration,
     Pairing,
     Diagnostics,
     Logs,
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 4] = [
+    const ALL: [(Self, &'static str); 5] = [
         (Self::Status, "Status"),
+        (Self::Configuration, "Configuration"),
         (Self::Pairing, "Pairing"),
         (Self::Diagnostics, "Diagnostics"),
         (Self::Logs, "Logs"),
@@ -61,6 +65,7 @@ pub struct DesktopApp {
     pairing_bundle_input: String,
     pairing_code_input: String,
     config_path_input: String,
+    config_editor: ConfigEditor,
     report: PlatformReport,
     notice: Option<Notice>,
     config_summary: Option<String>,
@@ -97,6 +102,14 @@ impl DesktopApp {
         };
 
         let report = platform::probe_host();
+        let config_path_input = settings
+            .config_path
+            .clone()
+            .unwrap_or_else(|| data_directory.join("config.toml"))
+            .display()
+            .to_string();
+        let config_editor = ConfigEditor::for_node(settings.node.as_ref());
+        let load_saved_config = settings.config_path.is_some();
         let mut app = Self {
             data_directory,
             node_input: settings
@@ -113,7 +126,8 @@ impl DesktopApp {
             page: initial_page(),
             pairing_bundle_input: String::new(),
             pairing_code_input: String::new(),
-            config_path_input: String::new(),
+            config_path_input,
+            config_editor,
             report,
             notice,
             config_summary: None,
@@ -121,6 +135,9 @@ impl DesktopApp {
             logs,
         };
         app.start_discovery();
+        if load_saved_config && app.identity.is_some() {
+            app.load_config();
+        }
         Ok(app)
     }
 
@@ -143,6 +160,7 @@ impl DesktopApp {
                 }
                 self.identity = Some(identity);
                 self.trust = Some(trust);
+                self.config_editor = ConfigEditor::for_node(Some(&node));
                 self.start_discovery();
                 tracing::info!(node = %node, "local identity ready");
                 self.notice = Some(Notice::success("Local identity ready"));
@@ -243,29 +261,78 @@ impl DesktopApp {
         self.confirm_remove = None;
     }
 
-    fn validate_config(&mut self) {
-        let path = Path::new(self.config_path_input.trim());
-        match Config::load(path) {
+    fn load_config(&mut self) {
+        let path = PathBuf::from(self.config_path_input.trim());
+        match Config::load(&path) {
             Ok(config) => {
-                let summary = match config.role {
-                    Role::Controller { listen, topology } => format!(
-                        "Controller {} | {listen} | {} screens",
-                        config.node,
-                        topology.screens().len()
-                    ),
-                    Role::Agent { controller } => {
-                        format!("Agent {} | controller {controller}", config.node)
-                    }
+                let Some(local_node) = self.identity.as_ref().map(LocalIdentity::node) else {
+                    self.notice = Some(Notice::error("Local identity is not ready"));
+                    return;
                 };
-                self.config_summary = Some(summary);
-                tracing::info!(path = %path.display(), "configuration valid");
-                self.notice = Some(Notice::success("Configuration valid"));
+                if &config.node != local_node {
+                    let message = format!(
+                        "Configuration belongs to `{}`, not `{local_node}`",
+                        config.node
+                    );
+                    tracing::warn!(
+                        path = %path.display(),
+                        configured_node = %config.node,
+                        local_node = %local_node,
+                        "configuration node mismatch"
+                    );
+                    self.notice = Some(Notice::error(message));
+                    return;
+                }
+                self.config_editor = ConfigEditor::from_config(&config);
+                self.config_summary = Some(config_summary(&config));
+                self.remember_config_path(&path);
+                tracing::info!(path = %path.display(), "configuration loaded");
+                self.notice = Some(Notice::success("Configuration loaded"));
             }
             Err(error) => {
                 self.config_summary = None;
-                tracing::warn!(path = %path.display(), error = %error, "configuration invalid");
+                tracing::warn!(path = %path.display(), error = %error, "configuration load failed");
                 self.notice = Some(Notice::error(error.to_string()));
             }
+        }
+    }
+
+    fn save_config(&mut self) {
+        let Some(local_node) = self.identity.as_ref().map(LocalIdentity::node) else {
+            self.notice = Some(Notice::error("Local identity is not ready"));
+            return;
+        };
+        let config = match self.config_editor.build(local_node.clone()) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(error, "configuration editor is invalid");
+                self.notice = Some(Notice::error(error));
+                return;
+            }
+        };
+        let path = PathBuf::from(self.config_path_input.trim());
+        if path.as_os_str().is_empty() {
+            self.notice = Some(Notice::error("Configuration path is required"));
+            return;
+        }
+        match config.save(&path) {
+            Ok(()) => {
+                self.config_summary = Some(config_summary(&config));
+                self.remember_config_path(&path);
+                tracing::info!(path = %path.display(), "configuration saved");
+                self.notice = Some(Notice::success("Configuration saved"));
+            }
+            Err(error) => {
+                tracing::error!(path = %path.display(), error = %error, "configuration save failed");
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn remember_config_path(&mut self, path: &Path) {
+        self.settings.config_path = Some(path.to_path_buf());
+        if let Err(error) = self.settings.save(&self.data_directory) {
+            tracing::warn!(error = %error, "could not remember configuration path");
         }
     }
 
@@ -285,7 +352,7 @@ impl DesktopApp {
                     ui.add_space(28.0);
                     ui.set_max_width(390.0);
                     ui.add(
-                        TextEdit::singleline(&mut self.node_input)
+                        singleline_text(&mut self.node_input)
                             .hint_text("node-id")
                             .desired_width(390.0),
                     );
@@ -355,6 +422,7 @@ impl DesktopApp {
                 ui.horizontal(|ui| {
                     ui.heading(match self.page {
                         Page::Status => "Status",
+                        Page::Configuration => "Configuration",
                         Page::Pairing => "Pairing",
                         Page::Diagnostics => "Diagnostics",
                         Page::Logs => "Logs",
@@ -385,6 +453,7 @@ impl DesktopApp {
                 }
                 ScrollArea::vertical().show(ui, |ui| match self.page {
                     Page::Status => self.status_view(ui),
+                    Page::Configuration => self.configuration_view(ui),
                     Page::Pairing => self.pairing_view(ui),
                     Page::Diagnostics => self.diagnostics_view(ui),
                     Page::Logs => self.logs_view(ui),
@@ -433,24 +502,143 @@ impl DesktopApp {
         metric_row(ui, "Transport", "TLS 1.3 / QUIC", ACCENT);
 
         ui.add_space(30.0);
-        section_heading(ui, "Configuration", "Validate a controller or agent file");
+        section_heading(ui, "Configuration", "Controller or agent");
+        ui.add_space(14.0);
+        if let Some(summary) = self.config_summary.as_ref() {
+            ui.label(RichText::new(summary).color(SUCCESS));
+            ui.add_space(10.0);
+        } else {
+            ui.label(RichText::new("Not saved").color(WARNING));
+            ui.add_space(10.0);
+        }
+        if ui
+            .add_sized([156.0, 34.0], Button::new("Edit configuration"))
+            .clicked()
+        {
+            self.page = Page::Configuration;
+            self.notice = None;
+        }
+    }
+
+    fn configuration_view(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            section_heading(ui, "Session configuration", "Validated TOML");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_sized([96.0, 34.0], Button::new("Save")).clicked() {
+                    self.save_config();
+                }
+            });
+        });
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             let available = (ui.available_width() - 110.0).max(160.0);
             ui.add_sized(
                 [available, 34.0],
-                TextEdit::singleline(&mut self.config_path_input).hint_text("Configuration path"),
+                singleline_text(&mut self.config_path_input).hint_text("Configuration path"),
             );
-            if ui
-                .add_sized([96.0, 34.0], Button::new("Validate"))
-                .clicked()
-            {
-                self.validate_config();
+            if ui.add_sized([96.0, 34.0], Button::new("Load")).clicked() {
+                self.load_config();
             }
         });
-        if let Some(summary) = self.config_summary.as_ref() {
-            ui.add_space(10.0);
-            ui.label(RichText::new(summary).color(SUCCESS));
+
+        ui.add_space(26.0);
+        ui.label(RichText::new("Role").color(MUTED));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.config_editor.role,
+                ConfigRole::Controller,
+                "Controller",
+            );
+            ui.selectable_value(&mut self.config_editor.role, ConfigRole::Agent, "Agent");
+        });
+
+        ui.add_space(22.0);
+        match self.config_editor.role {
+            ConfigRole::Controller => self.controller_configuration(ui),
+            ConfigRole::Agent => {
+                section_heading(ui, "Controller endpoint", "IP address and port");
+                ui.add_space(10.0);
+                labeled_text_field(
+                    ui,
+                    "Controller address",
+                    &mut self.config_editor.controller_address,
+                    "192.0.2.10:24800",
+                );
+            }
+        }
+    }
+
+    fn controller_configuration(&mut self, ui: &mut Ui) {
+        section_heading(ui, "Listen endpoint", "IP address and port");
+        ui.add_space(10.0);
+        labeled_text_field(
+            ui,
+            "Listen address",
+            &mut self.config_editor.listen_address,
+            "0.0.0.0:24800",
+        );
+
+        ui.add_space(26.0);
+        section_heading(
+            ui,
+            "Screen topology",
+            &format!("{} screens", self.config_editor.screens.len()),
+        );
+        ui.add_space(10.0);
+
+        let mut remove = None;
+        let can_remove_screen = self.config_editor.screens.len() > 1;
+        for (index, screen) in self.config_editor.screens.iter_mut().enumerate() {
+            Frame::new()
+                .fill(ELEVATED)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Screen {}", index + 1))
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(can_remove_screen, Button::new("Remove"))
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    labeled_text_field(ui, "Node", &mut screen.node, "node-id");
+                    ui.add_space(8.0);
+                    ui.columns(4, |columns| {
+                        compact_text_field(&mut columns[0], "X", &mut screen.x, "0");
+                        compact_text_field(&mut columns[1], "Y", &mut screen.y, "0");
+                        compact_text_field(&mut columns[2], "Width", &mut screen.width, "1920");
+                        compact_text_field(&mut columns[3], "Height", &mut screen.height, "1080");
+                    });
+                });
+            ui.add_space(8.0);
+        }
+        if let Some(index) = remove {
+            self.config_editor.screens.remove(index);
+        }
+
+        let suggested_node = self
+            .trust
+            .as_ref()
+            .and_then(|trust| {
+                trust
+                    .peers()
+                    .find(|peer| !self.config_editor.contains_node(peer.node()))
+            })
+            .map(|peer| peer.node().to_string())
+            .unwrap_or_else(|| String::from("peer-node"));
+        if ui.button("Add screen").clicked() {
+            self.config_editor.add_screen(suggested_node);
         }
     }
 
@@ -564,7 +752,7 @@ impl DesktopApp {
             let available = (ui.available_width() - 112.0).max(160.0);
             ui.add_sized(
                 [available, 34.0],
-                TextEdit::singleline(&mut self.pairing_code_input)
+                singleline_text(&mut self.pairing_code_input)
                     .hint_text("Verification code")
                     .font(TextStyle::Monospace),
             );
@@ -821,6 +1009,28 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
+fn singleline_text(text: &mut String) -> TextEdit<'_> {
+    TextEdit::singleline(text)
+        .vertical_align(Align::Center)
+        .margin(Margin::symmetric(8, 6))
+}
+
+fn labeled_text_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str) {
+    ui.label(RichText::new(label).color(MUTED));
+    ui.add_sized(
+        [ui.available_width(), 34.0],
+        singleline_text(text).hint_text(hint),
+    );
+}
+
+fn compact_text_field(ui: &mut Ui, label: &str, text: &mut String, hint: &str) {
+    ui.label(RichText::new(label).color(MUTED));
+    ui.add_sized(
+        [ui.available_width(), 34.0],
+        singleline_text(text).hint_text(hint),
+    );
+}
+
 fn section_heading(ui: &mut Ui, title: &str, detail: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).size(17.0).strong().color(TEXT));
@@ -908,10 +1118,14 @@ fn log_row(ui: &mut Ui, entry: &LogEntry) {
                     .color(MUTED),
             ),
         );
-        ui.add_sized(
-            [ui.available_width(), 20.0],
-            egui::Label::new(RichText::new(&entry.message).color(TEXT)).wrap(),
-        );
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(RichText::new(&entry.message).color(TEXT))
+                    .halign(Align::LEFT)
+                    .wrap(),
+            );
+        });
     });
     ui.separator();
 }
@@ -964,6 +1178,7 @@ const fn advertised_capabilities() -> Capabilities {
 #[cfg(feature = "screenshot-tests")]
 fn initial_page() -> Page {
     match std::env::var("TEVIR_SCREENSHOT_PAGE").as_deref() {
+        Ok("configuration") => Page::Configuration,
         Ok("pairing") => Page::Pairing,
         Ok("diagnostics") => Page::Diagnostics,
         Ok("logs") => Page::Logs,
@@ -974,6 +1189,183 @@ fn initial_page() -> Page {
 #[cfg(not(feature = "screenshot-tests"))]
 const fn initial_page() -> Page {
     Page::Status
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigRole {
+    Controller,
+    Agent,
+}
+
+struct ConfigEditor {
+    role: ConfigRole,
+    listen_address: String,
+    controller_address: String,
+    screens: Vec<ScreenEditor>,
+}
+
+impl ConfigEditor {
+    fn for_node(node: Option<&NodeId>) -> Self {
+        Self {
+            role: ConfigRole::Controller,
+            listen_address: String::from("0.0.0.0:24800"),
+            controller_address: String::from("127.0.0.1:24800"),
+            screens: vec![ScreenEditor {
+                node: node.map_or_else(|| String::from("local-node"), ToString::to_string),
+                x: String::from("0"),
+                y: String::from("0"),
+                width: String::from("1920"),
+                height: String::from("1080"),
+            }],
+        }
+    }
+
+    fn from_config(config: &Config) -> Self {
+        match &config.role {
+            Role::Controller { listen, topology } => Self {
+                role: ConfigRole::Controller,
+                listen_address: listen.to_string(),
+                controller_address: String::from("127.0.0.1:24800"),
+                screens: topology
+                    .screens()
+                    .iter()
+                    .map(ScreenEditor::from_placement)
+                    .collect(),
+            },
+            Role::Agent { controller } => Self {
+                role: ConfigRole::Agent,
+                listen_address: String::from("0.0.0.0:24800"),
+                controller_address: controller.to_string(),
+                screens: vec![ScreenEditor::from_local_node(&config.node)],
+            },
+        }
+    }
+
+    fn build(&self, node: NodeId) -> Result<Config, String> {
+        let role = match self.role {
+            ConfigRole::Controller => {
+                let listen = parse_socket_address("Listen address", &self.listen_address)?;
+                let screens = self
+                    .screens
+                    .iter()
+                    .enumerate()
+                    .map(|(index, screen)| screen.build(index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let topology = Topology::new(screens).map_err(|error| error.to_string())?;
+                Role::Controller { listen, topology }
+            }
+            ConfigRole::Agent => Role::Agent {
+                controller: parse_socket_address("Controller address", &self.controller_address)?,
+            },
+        };
+        Config::new(node, role).map_err(|error| error.to_string())
+    }
+
+    fn contains_node(&self, node: &NodeId) -> bool {
+        self.screens
+            .iter()
+            .any(|screen| screen.node.trim() == node.as_str())
+    }
+
+    fn add_screen(&mut self, node: String) {
+        let x = self
+            .screens
+            .iter()
+            .filter_map(|screen| {
+                let x = screen.x.parse::<i64>().ok()?;
+                let width = screen.width.parse::<i64>().ok()?;
+                Some(x.saturating_add(width))
+            })
+            .max()
+            .and_then(|x| i32::try_from(x).ok())
+            .unwrap_or(1920);
+        self.screens.push(ScreenEditor {
+            node,
+            x: x.to_string(),
+            y: String::from("0"),
+            width: String::from("1920"),
+            height: String::from("1080"),
+        });
+    }
+}
+
+struct ScreenEditor {
+    node: String,
+    x: String,
+    y: String,
+    width: String,
+    height: String,
+}
+
+impl ScreenEditor {
+    fn from_local_node(node: &NodeId) -> Self {
+        Self {
+            node: node.to_string(),
+            x: String::from("0"),
+            y: String::from("0"),
+            width: String::from("1920"),
+            height: String::from("1080"),
+        }
+    }
+
+    fn from_placement(placement: &ScreenPlacement) -> Self {
+        Self {
+            node: placement.node.to_string(),
+            x: placement.bounds.origin.x.to_string(),
+            y: placement.bounds.origin.y.to_string(),
+            width: placement.bounds.size.width.to_string(),
+            height: placement.bounds.size.height.to_string(),
+        }
+    }
+
+    fn build(&self, index: usize) -> Result<ScreenPlacement, String> {
+        let number = index + 1;
+        let node = NodeId::new(self.node.trim())
+            .map_err(|error| format!("Screen {number} node: {error}"))?;
+        let x = parse_i32(&format!("Screen {number} X"), &self.x)?;
+        let y = parse_i32(&format!("Screen {number} Y"), &self.y)?;
+        let width = parse_nonzero(&format!("Screen {number} width"), &self.width)?;
+        let height = parse_nonzero(&format!("Screen {number} height"), &self.height)?;
+        Ok(ScreenPlacement {
+            node,
+            bounds: Rect::new(Point { x, y }, Size::new(width, height)),
+        })
+    }
+}
+
+fn parse_socket_address(label: &str, value: &str) -> Result<SocketAddr, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|error| format!("{label}: {error}"))
+}
+
+fn parse_i32(label: &str, value: &str) -> Result<i32, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|error| format!("{label}: {error}"))
+}
+
+fn parse_nonzero(label: &str, value: &str) -> Result<NonZeroU32, String> {
+    let value = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("{label}: {error}"))?;
+    NonZeroU32::new(value).ok_or_else(|| format!("{label} must be greater than zero"))
+}
+
+fn config_summary(config: &Config) -> String {
+    match &config.role {
+        Role::Controller { listen, topology } => format!(
+            "Controller {} | {listen} | {} screens",
+            config.node,
+            topology.screens().len()
+        ),
+        Role::Agent { controller } => {
+            format!("Agent {} | controller {controller}", config.node)
+        }
+    }
 }
 
 struct Notice {
@@ -1029,7 +1421,7 @@ mod tests {
     use domain::NodeId;
     use tempfile::TempDir;
 
-    use super::DesktopApp;
+    use super::{ConfigEditor, ConfigRole, DesktopApp};
 
     #[test]
     fn node_override_initializes_the_desktop_identity() {
@@ -1050,5 +1442,35 @@ mod tests {
             Some(&node)
         );
         assert!(app.trust.is_some());
+    }
+
+    #[test]
+    fn configuration_editor_builds_a_valid_controller_topology() {
+        let node = NodeId::new("studio-left")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let mut editor = ConfigEditor::for_node(Some(&node));
+        editor.add_screen(String::from("studio-right"));
+
+        let config = editor
+            .build(node.clone())
+            .unwrap_or_else(|error| panic!("editor should build a valid configuration: {error}"));
+
+        assert_eq!(config.node, node);
+        assert!(matches!(
+            config.role,
+            crate::config::Role::Controller { topology, .. }
+                if topology.screens().len() == 2
+        ));
+    }
+
+    #[test]
+    fn configuration_editor_validates_agent_addresses() {
+        let node = NodeId::new("studio-right")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let mut editor = ConfigEditor::for_node(Some(&node));
+        editor.role = ConfigRole::Agent;
+        editor.controller_address = String::from("not-an-address");
+
+        assert!(editor.build(node).is_err());
     }
 }

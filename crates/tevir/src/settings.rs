@@ -14,6 +14,7 @@ const SETTINGS_FILE: &str = "desktop.toml";
 #[serde(deny_unknown_fields)]
 pub struct DesktopSettings {
     pub node: Option<NodeId>,
+    pub config_path: Option<PathBuf>,
 }
 
 impl DesktopSettings {
@@ -87,6 +88,7 @@ mod tests {
                 NodeId::new("studio-left")
                     .unwrap_or_else(|error| panic!("test node should be valid: {error}")),
             ),
+            config_path: Some(directory.path().join("tevir.toml")),
         };
         expected
             .save(directory.path())
