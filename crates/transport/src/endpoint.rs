@@ -61,6 +61,7 @@ impl SecureServer {
             .peers()
             .map(|peer| (peer.fingerprint(), peer.clone()))
             .collect();
+        tracing::info!(node = %identity.node(), address = %address, "secure server bound");
         Ok(Self {
             endpoint,
             identity,
@@ -88,6 +89,7 @@ impl SecureServer {
         let peer = match authenticated_peer(&connection, &self.peers_by_fingerprint) {
             Ok(peer) => peer,
             Err(error) => {
+                tracing::warn!(error = %error, "incoming peer authentication rejected");
                 connection.close(VarInt::from_u32(CLOSE_AUTHENTICATION), b"authentication");
                 return Err(error);
             }
@@ -182,6 +184,11 @@ impl SecureServer {
             self.limits.handshake_timeout(),
         )
         .await?;
+        tracing::info!(
+            peer = %hello.node,
+            session_id,
+            "secure peer session accepted"
+        );
 
         Ok(PeerConnection {
             connection,
@@ -221,6 +228,7 @@ impl SecureClient {
             .peers()
             .map(|peer| (peer.node().clone(), peer.clone()))
             .collect();
+        tracing::info!(node = %identity.node(), address = %address, "secure client bound");
         Ok(Self {
             endpoint,
             identity,
@@ -239,6 +247,7 @@ impl SecureClient {
         peer_node: &NodeId,
         address: SocketAddr,
     ) -> Result<PeerConnection, TransportError> {
+        tracing::info!(peer = %peer_node, address = %address, "connecting to secure peer");
         let peer = self
             .peers
             .get(peer_node)
@@ -337,6 +346,7 @@ impl SecureClient {
             connection.close(VarInt::from_u32(CLOSE_PROTOCOL), b"frame limit");
             return Err(TransportError::InvalidFrameLimit);
         }
+        tracing::info!(peer = %peer_node, session_id, "secure peer session established");
 
         Ok(PeerConnection {
             connection,
@@ -434,6 +444,7 @@ impl PeerConnection {
     }
 
     pub fn close(&self) {
+        tracing::info!(peer = %self.info.peer, session_id = self.info.session_id, "closing peer session");
         self.connection.close(VarInt::from_u32(0), b"closed");
     }
 

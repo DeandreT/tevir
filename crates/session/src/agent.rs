@@ -92,6 +92,11 @@ impl AgentSession {
         self.display_size = display_size;
         self.active_focus_epoch = None;
         self.pending_batch = None;
+        tracing::info!(
+            width = display_size.width.get(),
+            height = display_size.height.get(),
+            "display change invalidated remote focus"
+        );
         vec![AgentAction::ReleaseAllInput]
     }
 
@@ -108,6 +113,11 @@ impl AgentSession {
         entry_position: Point,
     ) -> Result<Vec<AgentAction>, AgentError> {
         if focus_epoch < self.highest_focus_epoch {
+            tracing::debug!(
+                received = focus_epoch,
+                current = self.highest_focus_epoch,
+                "ignored stale focus change"
+            );
             return Ok(Vec::new());
         }
 
@@ -141,6 +151,12 @@ impl AgentSession {
         let was_active = self.active_focus_epoch.take().is_some();
         self.highest_focus_epoch = focus_epoch;
         self.last_focus = Some(next_focus.clone());
+        tracing::info!(
+            focus_epoch,
+            target = %next_focus.target,
+            local = next_focus.target == self.local_node,
+            "agent focus changed"
+        );
 
         let mut actions = Vec::new();
         if was_active {
@@ -198,6 +214,7 @@ impl AgentSession {
         self.active_focus_epoch = None;
         self.pending_batch = None;
         self.closed = true;
+        tracing::info!("agent session closed");
         vec![AgentAction::ReleaseAllInput, AgentAction::CloseConnection]
     }
 }

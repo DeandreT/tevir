@@ -86,6 +86,11 @@ impl std::fmt::Debug for CaptureService {
 impl CaptureService {
     pub fn start(edges: &[Edge]) -> Result<Self, BackendError> {
         validate_edges(edges)?;
+        tracing::info!(
+            backend = ?crate::native_capture_kind(),
+            edges = edges.len(),
+            "starting input capture service"
+        );
         let (commands, command_rx) = tokio_mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(SERVICE_QUEUE_CAPACITY);
         let edges = edges.to_vec();
@@ -153,6 +158,10 @@ impl std::fmt::Debug for InjectionService {
 
 impl InjectionService {
     pub fn start() -> Result<Self, BackendError> {
+        tracing::info!(
+            backend = ?crate::native_emulation_kind(),
+            "starting input injection service"
+        );
         let (commands, command_rx) = tokio_mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(SERVICE_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
@@ -284,6 +293,7 @@ async fn run_capture(
         let _ = capture.terminate().await;
         return;
     }
+    tracing::info!(backend = ?crate::native_capture_kind(), "input capture service ready");
 
     let mut held = HeldInput::default();
     loop {
@@ -346,6 +356,7 @@ async fn run_capture(
     let _ = capture.release().await;
     let _ = capture.terminate().await;
     let _ = events.send(CaptureServiceEvent::Stopped);
+    tracing::info!("input capture service stopped");
 }
 
 fn emit_capture_releases(events: &SyncSender<CaptureServiceEvent>, held: &mut HeldInput) {
@@ -381,6 +392,10 @@ async fn run_injection(
         injection.terminate().await;
         return;
     }
+    tracing::info!(
+        backend = ?crate::native_emulation_kind(),
+        "input injection service ready"
+    );
 
     let mut held = HeldInput::default();
     while let Some(command) = commands.recv().await {
@@ -405,6 +420,7 @@ async fn run_injection(
     injection.destroy(ENGINE_HANDLE).await;
     injection.terminate().await;
     let _ = events.send(InjectionServiceEvent::Stopped);
+    tracing::info!("input injection service stopped");
 }
 
 async fn release_injected_input(
@@ -433,6 +449,7 @@ fn send_capture_failure(
     operation: &'static str,
     error: &impl std::fmt::Display,
 ) {
+    tracing::error!(operation, error = %error, "input capture service failed");
     let _ = events.send(CaptureServiceEvent::Failed {
         operation,
         reason: error.to_string(),
@@ -444,6 +461,7 @@ fn send_injection_failure(
     operation: &'static str,
     error: &impl std::fmt::Display,
 ) {
+    tracing::error!(operation, error = %error, "input injection service failed");
     let _ = events.send(InjectionServiceEvent::Failed {
         operation,
         reason: error.to_string(),

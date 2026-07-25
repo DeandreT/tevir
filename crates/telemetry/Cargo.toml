@@ -1,5 +1,6 @@
 [package]
-name = "session"
+name = "telemetry"
+description = "Structured logging and bounded diagnostics for Tevir"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +9,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-domain = { path = "../domain" }
-protocol = { path = "../protocol" }
 thiserror.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

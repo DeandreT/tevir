@@ -16,6 +16,7 @@ keycode.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capture-engine = { package = "input-capture", version = "0.4.0", default-features = false, features = ["libei"] }

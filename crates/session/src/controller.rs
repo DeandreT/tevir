@@ -120,6 +120,11 @@ impl ControllerSession {
             .get_mut(&self.focus)
             .ok_or_else(|| ControllerError::UnknownPeer(self.focus.clone()))?;
         if delivery.pending.len() >= MAX_PENDING_BATCHES_PER_PEER {
+            tracing::warn!(
+                peer = %self.focus,
+                pending = delivery.pending.len(),
+                "input delivery backpressure"
+            );
             return Err(ControllerError::Backpressure {
                 peer: self.focus.clone(),
                 maximum: MAX_PENDING_BATCHES_PER_PEER,
@@ -246,6 +251,11 @@ impl ControllerSession {
             .focus_epoch
             .checked_add(1)
             .ok_or(ControllerError::FocusEpochExhausted)?;
+        tracing::info!(
+            focus = %self.focus,
+            focus_epoch = self.focus_epoch,
+            "controller focus changed"
+        );
         let mut actions = Vec::new();
         if self.focus == self.local_node {
             actions.push(ControllerAction::ReleaseCapture);

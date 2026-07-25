@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use domain::NodeId;
 use eframe::egui::{
@@ -7,6 +10,7 @@ use eframe::egui::{
 };
 use identity::{IdentityStore, LocalIdentity, PairingBundle, TrustStore};
 use platform::{EnvironmentStatus, PlatformReport};
+use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
     config::{Config, Role},
@@ -30,13 +34,15 @@ enum Page {
     Status,
     Pairing,
     Diagnostics,
+    Logs,
 }
 
 impl Page {
-    const ALL: [(Self, &'static str); 3] = [
+    const ALL: [(Self, &'static str); 4] = [
         (Self::Status, "Status"),
         (Self::Pairing, "Pairing"),
         (Self::Diagnostics, "Diagnostics"),
+        (Self::Logs, "Logs"),
     ];
 }
 
@@ -54,10 +60,15 @@ pub struct DesktopApp {
     notice: Option<Notice>,
     config_summary: Option<String>,
     confirm_remove: Option<NodeId>,
+    logs: LogBuffer,
 }
 
 impl DesktopApp {
-    pub fn load(data_directory: PathBuf, node_override: Option<NodeId>) -> Result<Self, AppError> {
+    pub fn load(
+        data_directory: PathBuf,
+        node_override: Option<NodeId>,
+        logs: LogBuffer,
+    ) -> Result<Self, AppError> {
         let mut settings = DesktopSettings::load(&data_directory)?;
         if let Some(node) = node_override {
             settings.node = Some(node);
@@ -70,7 +81,10 @@ impl DesktopApp {
                 Err(error) => (
                     None,
                     None,
-                    Some(Notice::error(format!("Identity unavailable: {error}"))),
+                    Some({
+                        tracing::error!(node = %node, error = %error, "identity unavailable");
+                        Notice::error(format!("Identity unavailable: {error}"))
+                    }),
                 ),
             }
         } else {
@@ -95,6 +109,7 @@ impl DesktopApp {
             notice,
             config_summary: None,
             confirm_remove: None,
+            logs,
         })
     }
 
@@ -102,22 +117,28 @@ impl DesktopApp {
         let node = match NodeId::new(self.node_input.trim()) {
             Ok(node) => node,
             Err(error) => {
+                tracing::warn!(error = %error, "invalid node identity");
                 self.notice = Some(Notice::error(error.to_string()));
                 return;
             }
         };
         match load_identity(&self.data_directory, &node) {
             Ok((identity, trust)) => {
-                self.settings.node = Some(node);
+                self.settings.node = Some(node.clone());
                 if let Err(error) = self.settings.save(&self.data_directory) {
+                    tracing::error!(node = %node, error = %error, "could not save desktop settings");
                     self.notice = Some(Notice::error(error.to_string()));
                     return;
                 }
                 self.identity = Some(identity);
                 self.trust = Some(trust);
+                tracing::info!(node = %node, "local identity ready");
                 self.notice = Some(Notice::success("Local identity ready"));
             }
-            Err(error) => self.notice = Some(Notice::error(error)),
+            Err(error) => {
+                tracing::error!(node = %node, error, "could not initialize local identity");
+                self.notice = Some(Notice::error(error));
+            }
         }
     }
 
@@ -125,6 +146,7 @@ impl DesktopApp {
         let bundle = match PairingBundle::decode(&self.pairing_bundle_input) {
             Ok(bundle) => bundle,
             Err(error) => {
+                tracing::warn!(error = %error, "pairing bundle rejected");
                 self.notice = Some(Notice::error(error.to_string()));
                 return;
             }
@@ -136,11 +158,15 @@ impl DesktopApp {
         };
         match trust.trust(bundle, &self.pairing_code_input) {
             Ok(()) => {
+                tracing::info!(peer = %node, "peer trusted");
                 self.pairing_bundle_input.clear();
                 self.pairing_code_input.clear();
                 self.notice = Some(Notice::success(format!("Paired with {node}")));
             }
-            Err(error) => self.notice = Some(Notice::error(error.to_string())),
+            Err(error) => {
+                tracing::warn!(peer = %node, error = %error, "peer trust rejected");
+                self.notice = Some(Notice::error(error.to_string()));
+            }
         }
     }
 
@@ -149,9 +175,18 @@ impl DesktopApp {
             return;
         };
         match trust.remove(node) {
-            Ok(true) => self.notice = Some(Notice::success(format!("Removed {node}"))),
-            Ok(false) => self.notice = Some(Notice::error(format!("{node} is not paired"))),
-            Err(error) => self.notice = Some(Notice::error(error.to_string())),
+            Ok(true) => {
+                tracing::info!(peer = %node, "peer trust removed");
+                self.notice = Some(Notice::success(format!("Removed {node}")));
+            }
+            Ok(false) => {
+                tracing::warn!(peer = %node, "peer was not trusted");
+                self.notice = Some(Notice::error(format!("{node} is not paired")));
+            }
+            Err(error) => {
+                tracing::error!(peer = %node, error = %error, "could not remove peer trust");
+                self.notice = Some(Notice::error(error.to_string()));
+            }
         }
         self.confirm_remove = None;
     }
@@ -171,10 +206,12 @@ impl DesktopApp {
                     }
                 };
                 self.config_summary = Some(summary);
+                tracing::info!(path = %path.display(), "configuration valid");
                 self.notice = Some(Notice::success("Configuration valid"));
             }
             Err(error) => {
                 self.config_summary = None;
+                tracing::warn!(path = %path.display(), error = %error, "configuration invalid");
                 self.notice = Some(Notice::error(error.to_string()));
             }
         }
@@ -268,6 +305,7 @@ impl DesktopApp {
                         Page::Status => "Status",
                         Page::Pairing => "Pairing",
                         Page::Diagnostics => "Diagnostics",
+                        Page::Logs => "Logs",
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let ready = self.report.is_available() && self.peer_count() > 0;
@@ -297,6 +335,7 @@ impl DesktopApp {
                     Page::Status => self.status_view(ui),
                     Page::Pairing => self.pairing_view(ui),
                     Page::Diagnostics => self.diagnostics_view(ui),
+                    Page::Logs => self.logs_view(ui),
                 });
             });
     }
@@ -481,6 +520,11 @@ impl DesktopApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Refresh").clicked() {
                     self.report = platform::probe_host();
+                    tracing::info!(
+                        available = self.report.is_available(),
+                        issues = self.report.issues.len(),
+                        "platform diagnostics refreshed"
+                    );
                     self.notice = Some(Notice::success("Diagnostics refreshed"));
                 }
             });
@@ -531,6 +575,27 @@ impl DesktopApp {
         }
     }
 
+    fn logs_view(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            section_heading(ui, "Application events", "Current process");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    self.logs.clear();
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        let entries = self.logs.snapshot();
+        if entries.is_empty() {
+            empty_state(ui, "No events recorded");
+            return;
+        }
+        for entry in entries {
+            log_row(ui, &entry);
+        }
+    }
+
     fn peer_count(&self) -> usize {
         self.trust.as_ref().map_or(0, |trust| trust.peers().len())
     }
@@ -545,11 +610,14 @@ impl eframe::App for DesktopApp {
         self.navigation(ui);
         self.top_bar(ui);
         self.content(ui);
+        if self.page == Page::Logs {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
     }
 }
 
-pub fn run(data_directory: PathBuf, node: Option<NodeId>) -> Result<(), AppError> {
-    let app = DesktopApp::load(data_directory, node)?;
+pub fn run(data_directory: PathBuf, node: Option<NodeId>, logs: LogBuffer) -> Result<(), AppError> {
+    let app = DesktopApp::load(data_directory, node, logs)?;
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Tevir")
@@ -680,6 +748,57 @@ fn empty_state(ui: &mut Ui, label: &str) {
         });
 }
 
+fn log_row(ui: &mut Ui, entry: &LogEntry) {
+    let color = match entry.level {
+        LogLevel::Trace | LogLevel::Debug => MUTED,
+        LogLevel::Info => ACCENT,
+        LogLevel::Warn => WARNING,
+        LogLevel::Error => DANGER,
+    };
+    ui.horizontal_top(|ui| {
+        ui.add_sized(
+            [82.0, 20.0],
+            egui::Label::new(
+                RichText::new(format_elapsed(entry.elapsed_millis))
+                    .family(FontFamily::Monospace)
+                    .color(MUTED),
+            ),
+        );
+        ui.add_sized(
+            [48.0, 20.0],
+            egui::Label::new(
+                RichText::new(entry.level.as_str())
+                    .family(FontFamily::Monospace)
+                    .color(color),
+            ),
+        );
+        ui.add_sized(
+            [96.0, 20.0],
+            egui::Label::new(
+                RichText::new(component_target(&entry.target))
+                    .family(FontFamily::Monospace)
+                    .color(MUTED),
+            ),
+        );
+        ui.add_sized(
+            [ui.available_width(), 20.0],
+            egui::Label::new(RichText::new(&entry.message).color(TEXT)).wrap(),
+        );
+    });
+    ui.separator();
+}
+
+fn format_elapsed(elapsed_millis: u128) -> String {
+    let minutes = elapsed_millis / 60_000;
+    let seconds = (elapsed_millis / 1_000) % 60;
+    let millis = elapsed_millis % 1_000;
+    format!("+{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn component_target(target: &str) -> &str {
+    target.split("::").next().unwrap_or(target)
+}
+
 fn format_fingerprint(fingerprint: [u8; 32]) -> String {
     fingerprint[..12]
         .chunks_exact(2)
@@ -693,6 +812,7 @@ fn initial_page() -> Page {
     match std::env::var("TEVIR_SCREENSHOT_PAGE").as_deref() {
         Ok("pairing") => Page::Pairing,
         Ok("diagnostics") => Page::Diagnostics,
+        Ok("logs") => Page::Logs,
         _ => Page::Status,
     }
 }
@@ -756,8 +876,12 @@ mod tests {
             TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
         let node = NodeId::new("studio-left")
             .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
-        let app = DesktopApp::load(directory.path().to_path_buf(), Some(node.clone()))
-            .unwrap_or_else(|error| panic!("desktop initialization failed: {error}"));
+        let app = DesktopApp::load(
+            directory.path().to_path_buf(),
+            Some(node.clone()),
+            telemetry::LogBuffer::default(),
+        )
+        .unwrap_or_else(|error| panic!("desktop initialization failed: {error}"));
 
         assert_eq!(app.settings.node.as_ref(), Some(&node));
         assert_eq!(

@@ -66,16 +66,25 @@ impl IdentityStore {
         create_private_directory(&self.root)?;
         let path = self.root.join(CREDENTIAL_FILE);
         match fs::read_to_string(&path) {
-            Ok(contents) => parse_identity(&contents, node),
+            Ok(contents) => {
+                let identity = parse_identity(&contents, node)?;
+                tracing::debug!(node = %node, "local identity loaded");
+                Ok(identity)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let identity = generate_identity(node)?;
                 let contents = encode_identity(&identity)?;
                 match write_new_private_file(&path, contents.as_bytes()) {
-                    Ok(()) => Ok(identity),
+                    Ok(()) => {
+                        tracing::info!(node = %node, "local identity created");
+                        Ok(identity)
+                    }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         let contents =
                             fs::read_to_string(&path).map_err(IdentityError::ReadCredential)?;
-                        parse_identity(&contents, node)
+                        let identity = parse_identity(&contents, node)?;
+                        tracing::debug!(node = %node, "local identity loaded after concurrent creation");
+                        Ok(identity)
                     }
                     Err(error) => Err(IdentityError::WriteCredential(error)),
                 }
@@ -132,6 +141,7 @@ impl TrustStore {
         }
 
         ensure_unique_certificates(&peers)?;
+        tracing::debug!(peers = peers.len(), "trust store loaded");
         Ok(Self { directory, peers })
     }
 
@@ -173,6 +183,7 @@ impl TrustStore {
                 source,
             }
         })?;
+        tracing::info!(peer = %peer.node, "peer trust stored");
         self.peers.insert(peer.node.clone(), peer);
         Ok(())
     }
@@ -183,6 +194,7 @@ impl TrustStore {
         }
         let path = self.peer_path(node);
         fs::remove_file(&path).map_err(|source| TrustError::RemovePeer { path, source })?;
+        tracing::info!(peer = %node, "peer trust removed");
         Ok(true)
     }
 

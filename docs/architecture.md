@@ -15,7 +15,7 @@ behavior.
 ## Dependency Direction
 
 ```text
-tevir     -> domain, identity, platform, protocol
+tevir     -> domain, identity, platform, protocol, telemetry
 transport -> domain, identity, protocol
 session   -> domain, protocol
 identity  -> domain
@@ -37,6 +37,14 @@ commands. Linux builds enable only eframe's Wayland window backend.
 
 Native handles, portal objects, Windows messages, and operating-system key
 codes must remain inside `platform`. Wire DTOs must remain inside `protocol`.
+
+## Observability
+
+Runtime components emit structured `tracing` events at lifecycle, focus,
+security, backpressure, and failure boundaries. The executable writes those
+events to stderr, seven retained daily files, and a bounded in-memory buffer
+shown in the desktop Logs view. Pairing material, credentials, clipboard
+contents, and individual input events must never enter logs.
 
 ## Input Model
 

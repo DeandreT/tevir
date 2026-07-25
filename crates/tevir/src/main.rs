@@ -42,34 +42,76 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let logging = match logging_directory(&cli) {
+        Ok(directory) => telemetry::initialize(&directory).or_else(|error| {
+            eprintln!("warning: persistent logging unavailable: {error}");
+            telemetry::initialize_ephemeral()
+        }),
+        Err(error) => {
+            eprintln!("warning: persistent logging unavailable: {error}");
+            telemetry::initialize_ephemeral()
+        }
+    };
+    let logging = match logging {
+        Ok(logging) => logging,
+        Err(error) => {
+            eprintln!("error: could not initialize logging: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "application started");
+
+    match run(cli, logging.buffer()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            tracing::error!(error = %error, "application failed");
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(cli: Cli) -> Result<(), CliError> {
+fn logging_directory(cli: &Cli) -> Result<PathBuf, CliError> {
+    let data_directory = match &cli.command {
+        Some(Command::Ui {
+            data_dir: Some(data_directory),
+            ..
+        }) => data_directory.clone(),
+        None
+        | Some(Command::Ui { data_dir: None, .. })
+        | Some(Command::Doctor { .. })
+        | Some(Command::Check { .. }) => {
+            settings::default_data_directory().map_err(app::AppError::from)?
+        }
+    };
+    Ok(data_directory.join("logs"))
+}
+
+fn run(cli: Cli, logs: telemetry::LogBuffer) -> Result<(), CliError> {
     match cli.command {
-        None => open_ui(None, None),
-        Some(Command::Ui { node, data_dir }) => open_ui(node, data_dir),
+        None => open_ui(None, None, logs),
+        Some(Command::Ui { node, data_dir }) => open_ui(node, data_dir, logs),
         Some(Command::Doctor { json }) => doctor(json),
         Some(Command::Check { config }) => check_config(&config),
     }
 }
 
-fn open_ui(node: Option<String>, data_dir: Option<PathBuf>) -> Result<(), CliError> {
+fn open_ui(
+    node: Option<String>,
+    data_dir: Option<PathBuf>,
+    logs: telemetry::LogBuffer,
+) -> Result<(), CliError> {
     let node = node.map(NodeId::new).transpose()?;
     let data_directory = data_dir
         .map_or_else(settings::default_data_directory, Ok)
         .map_err(app::AppError::from)?;
-    app::run(data_directory, node)?;
+    app::run(data_directory, node, logs)?;
     Ok(())
 }
 
 fn doctor(json: bool) -> Result<(), CliError> {
+    tracing::info!(json, "running platform diagnostics");
     let report = platform::probe_host();
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -99,6 +141,7 @@ fn print_report(report: &PlatformReport) {
 }
 
 fn check_config(path: &std::path::Path) -> Result<(), CliError> {
+    tracing::info!(path = %path.display(), "validating configuration");
     let config = Config::load(path)?;
     match &config.role {
         Role::Controller { listen, topology } => println!(
