@@ -14,7 +14,8 @@ the focused node.
 - `transport`: mutually authenticated QUIC sessions and isolated bulk streams.
 - `session`: focus routing, ordered input delivery, and clipboard ownership.
 - `telemetry`: structured file, stderr, and desktop diagnostics.
-- `platform`: native input services and Windows/Wayland host probes.
+- `platform`: bounded native input and clipboard services for Windows and
+  Wayland.
 - `tevir`: the executable, validated TOML configuration, and diagnostics.
 
 ## Development

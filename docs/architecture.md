@@ -25,12 +25,12 @@ protocol  -> domain
 ```
 
 `domain` is deterministic and performs no I/O. `protocol` owns serialization,
-limits, and wire validation. `platform` translates native input to and from
-domain events without depending on networking. `identity` owns local
-credentials and explicit peer trust. `transport` owns authenticated QUIC
-connections, stream separation, and network deadlines. `session` owns the
-deterministic controller and agent state machines. The `tevir` executable owns
-configuration, process lifecycle, discovery polling, and session orchestration.
+limits, and wire validation. `platform` translates native input and clipboard
+operations without depending on networking. `identity` owns local credentials
+and explicit peer trust. `transport` owns authenticated QUIC connections,
+stream separation, and network deadlines. `session` owns the deterministic
+controller and agent state machines. The `tevir` executable owns configuration,
+process lifecycle, discovery polling, and session orchestration.
 
 `discovery` publishes and browses a DNS-SD service on the local network. Records
 carry the exact protocol version, platform, capabilities, certificate
@@ -70,11 +70,14 @@ the receiving backend releases all held input before accepting a new epoch.
 
 Linux support is Wayland-only. Capture and injection use desktop portals and
 EIS instead of compositor-specific protocols, privileged `/dev/input` access,
-or X11 compatibility.
+or X11 compatibility. Clipboard access uses the XDG Clipboard portal attached
+to a RemoteDesktop session. Portal reads and writes have fixed deadlines and
+accept only bounded UTF-8 `text/plain` selections.
 
 Windows capture and injection use low-level hooks on a dedicated message-loop
-thread and `SendInput`. Native engines remain behind Tevir's bounded service
-queues and platform-neutral input model.
+thread and `SendInput`. Clipboard access uses the native Windows clipboard and
+suppresses notifications caused by its own writes. Native engines remain behind
+Tevir's bounded service queues and platform-neutral input model.
 
 ## Protocol
 
@@ -112,6 +115,9 @@ one native application in flight and at most one newer inbound generation;
 newer updates replace incomplete older ones. An applied message is emitted only
 after the platform confirms its write. The corresponding native change
 notification is suppressed so received content is not sent back to its owner.
+Native workers expose bounded command and event queues and never put clipboard
+contents in logs. Platform MIME and format details terminate at the native
+boundary; only validated UTF-8 text enters the protocol.
 
 ## State And Backpressure
 
