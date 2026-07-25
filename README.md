@@ -39,3 +39,8 @@ cargo run -p tevir -- check examples/agent.toml
 
 See [architecture.md](docs/architecture.md) for the component boundaries and
 [ROADMAP.md](ROADMAP.md) for the implementation order.
+
+## License
+
+Tevir is licensed under the GNU General Public License v3.0 only. See
+[LICENSE](LICENSE).
