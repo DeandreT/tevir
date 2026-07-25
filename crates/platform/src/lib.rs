@@ -1,8 +1,9 @@
-//! Native platform boundaries for input capture and injection.
+//! Native platform boundaries for input and clipboard access.
 //!
 //! Native event loops belong on dedicated threads. Implementations expose only
 //! the platform-neutral domain events defined by the `domain` crate.
 
+mod clipboard;
 mod convert;
 #[cfg(target_os = "linux")]
 mod linux_wayland;
@@ -11,6 +12,7 @@ mod state;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub use clipboard::{ClipboardService, ClipboardServiceEvent};
 pub use domain::HostPlatform;
 use serde::Serialize;
 pub use service::{
@@ -92,4 +94,6 @@ pub enum BackendError {
     WorkerStopped,
     #[error("backend worker thread panicked")]
     WorkerPanicked,
+    #[error("clipboard text is {actual} bytes; the maximum is {maximum}")]
+    ClipboardTextTooLarge { actual: usize, maximum: usize },
 }

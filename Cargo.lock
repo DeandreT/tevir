@@ -2624,6 +2624,8 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "platform"
 version = "0.1.0"
 dependencies = [
+ "arboard",
+ "ashpd",
  "domain",
  "futures-util",
  "input-capture",
@@ -2631,6 +2633,7 @@ dependencies = [
  "input-event",
  "keycode",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

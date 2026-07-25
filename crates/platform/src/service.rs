@@ -17,14 +17,16 @@ use crate::{
 };
 
 const ENGINE_HANDLE: u64 = 1;
-const COMMAND_QUEUE_CAPACITY: usize = 32;
+pub(crate) const COMMAND_QUEUE_CAPACITY: usize = 32;
 pub const SERVICE_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    LinuxWaylandClipboardPortal,
     LinuxWaylandInputCapture,
     LinuxWaylandRemoteDesktop,
+    WindowsClipboard,
     WindowsHooks,
     WindowsSendInput,
 }
@@ -233,21 +235,21 @@ fn validate_edges(edges: &[Edge]) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn map_try_send_error<T>(error: tokio_mpsc::error::TrySendError<T>) -> BackendError {
+pub(crate) fn map_try_send_error<T>(error: tokio_mpsc::error::TrySendError<T>) -> BackendError {
     match error {
         tokio_mpsc::error::TrySendError::Full(_) => BackendError::CommandQueueFull,
         tokio_mpsc::error::TrySendError::Closed(_) => BackendError::WorkerStopped,
     }
 }
 
-fn join_worker(worker: Option<JoinHandle<()>>) -> Result<(), BackendError> {
+pub(crate) fn join_worker(worker: Option<JoinHandle<()>>) -> Result<(), BackendError> {
     if worker.is_some_and(|worker| worker.join().is_err()) {
         return Err(BackendError::WorkerPanicked);
     }
     Ok(())
 }
 
-fn run_local_worker(future: impl Future<Output = ()> + 'static) {
+pub(crate) fn run_local_worker(future: impl Future<Output = ()> + 'static) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
