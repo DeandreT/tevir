@@ -15,21 +15,21 @@ behavior.
 ## Dependency Direction
 
 ```text
-domain <- protocol <- transport
-   ^                    ^
-   |                    |
-platform              tevir
-                         ^
-                         |
-                     identity
+tevir     -> domain, identity, platform, protocol
+transport -> domain, identity, protocol
+session   -> domain, protocol
+identity  -> domain
+platform  -> domain
+protocol  -> domain
 ```
 
 `domain` is deterministic and performs no I/O. `protocol` owns serialization,
 limits, and wire validation. `platform` translates native input to and from
 domain events without depending on networking. `identity` owns local
 credentials and explicit peer trust. `transport` owns authenticated QUIC
-connections, stream separation, and network deadlines. The `tevir` executable
-owns configuration, process lifecycle, and session orchestration.
+connections, stream separation, and network deadlines. `session` owns the
+deterministic controller and agent state machines. The `tevir` executable owns
+configuration, process lifecycle, and session orchestration.
 
 The desktop surface uses `eframe` and `egui`. Its pairing and validation
 actions call the same identity and configuration boundaries as non-graphical
@@ -87,14 +87,19 @@ bounded.
 
 The controller is the sole authority for focus epochs and topology. Each input
 batch carries its epoch and a monotonically increasing sequence. An agent
-acknowledges the highest contiguous sequence it applied. It rejects stale
-epochs and releases held state when a stream breaks.
+acknowledges the highest contiguous sequence only after native application is
+confirmed. Duplicate batches repeat the last acknowledgement without
+reinjection; gaps and stale epochs are rejected. Focus changes, display changes,
+and broken connections release held state before another epoch can inject
+input.
 
 Topology rectangles use controller-global coordinates. An edge transition
 converts the entry point to destination-local coordinates before it enters a
-protocol message.
+protocol message. The controller retains subpixel pointer motion, supports
+negative global coordinates, and only crosses between rectangles that share an
+edge.
 
 Key and button transitions are never dropped. Pointer motion may be coalesced
-before serialization. Every queue and clipboard payload is bounded; overload
-disconnects or degrades pointer sampling instead of growing memory without a
-limit.
+before serialization, but never across a key, button, or scroll boundary. Every
+queue and clipboard payload is bounded; overload produces an explicit
+backpressure condition instead of growing memory without a limit.

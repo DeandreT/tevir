@@ -34,12 +34,12 @@
 
 ## 3. Routing Session
 
-- Build the controller and agent state machines around focus epochs and
+- [x] Build the controller and agent state machines around focus epochs and
   acknowledged event sequences.
-- Route edge crossings through `Topology`, including mixed resolutions and
+- [x] Route edge crossings through `Topology`, including mixed resolutions and
   negative coordinates.
-- Coalesce pointer motion without coalescing key or button transitions.
-- Reconcile display changes and prevent stale input after focus moves.
+- [x] Coalesce pointer motion without coalescing key or button transitions.
+- [x] Reconcile display changes and prevent stale input after focus moves.
 
 ## 4. Clipboard
 
