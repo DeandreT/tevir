@@ -92,6 +92,8 @@ pub enum BackendError {
     CommandQueueFull,
     #[error("native input batch cannot be empty")]
     EmptyInputBatch,
+    #[error("native input session generation is exhausted")]
+    SessionGenerationExhausted,
     #[error("backend worker has stopped")]
     WorkerStopped,
     #[error("backend worker thread panicked")]

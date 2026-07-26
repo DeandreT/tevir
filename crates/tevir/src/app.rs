@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use discovery::{DiscoveredNode, DiscoveryService, NearbyNodes};
@@ -19,7 +19,7 @@ use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
     config::{Config, Role},
-    runtime::{RuntimeEvent, RuntimeRole, SessionRuntime},
+    runtime::{NativeInputHost, RuntimeEvent, RuntimeRole, SessionRuntime},
     settings::{DesktopSettings, SettingsError},
 };
 
@@ -69,6 +69,9 @@ pub struct DesktopApp {
     config_path_input: String,
     config_editor: ConfigEditor,
     saved_config: Option<Config>,
+    startup_config: Option<Config>,
+    native_input: Option<NativeInputHost>,
+    native_retry_at: Option<Instant>,
     session_runtime: Option<SessionRuntime>,
     session_state: SessionState,
     report: PlatformReport,
@@ -134,6 +137,9 @@ impl DesktopApp {
             config_path_input,
             config_editor,
             saved_config: None,
+            startup_config: None,
+            native_input: None,
+            native_retry_at: None,
             session_runtime: None,
             session_state: SessionState::default(),
             report,
@@ -144,7 +150,7 @@ impl DesktopApp {
         };
         app.start_discovery();
         if load_saved_config && app.identity.is_some() {
-            app.load_config();
+            app.restore_config();
         }
         Ok(app)
     }
@@ -286,6 +292,14 @@ impl DesktopApp {
     }
 
     fn load_config(&mut self) {
+        self.load_config_from_path(true);
+    }
+
+    fn restore_config(&mut self) {
+        self.load_config_from_path(false);
+    }
+
+    fn load_config_from_path(&mut self, start_session: bool) {
         let path = PathBuf::from(self.config_path_input.trim());
         match Config::load(&path) {
             Ok(config) => {
@@ -314,7 +328,11 @@ impl DesktopApp {
                 self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration loaded");
                 self.notice = Some(Notice::success("Configuration loaded"));
-                self.start_session(config);
+                if start_session {
+                    self.start_session(config);
+                } else {
+                    self.startup_config = Some(config);
+                }
             }
             Err(error) => {
                 self.config_summary = None;
@@ -323,6 +341,30 @@ impl DesktopApp {
                 self.notice = Some(Notice::error(error.to_string()));
             }
         }
+    }
+
+    fn start_deferred_session(&mut self, context: &egui::Context) {
+        let Some(mut config) = self.startup_config.take() else {
+            return;
+        };
+        if matches!(&config.role, Role::Agent { .. })
+            && let Some((width, height)) = current_monitor_pixels(context)
+        {
+            self.config_editor.set_agent_monitor(width, height);
+            if let Some(local_node) = self.identity.as_ref().map(LocalIdentity::node)
+                && let Ok(updated) = self.config_editor.build(local_node.clone())
+            {
+                config = updated;
+                self.saved_config = Some(config.clone());
+                self.config_summary = Some(config_summary(&config));
+                tracing::info!(
+                    width,
+                    height,
+                    "agent monitor dimensions detected at startup"
+                );
+            }
+        }
+        self.start_session(config);
     }
 
     fn save_config(&mut self) {
@@ -383,7 +425,14 @@ impl DesktopApp {
             self.notice = Some(Notice::error("Trust store is not ready"));
             return;
         };
-        match SessionRuntime::start(config, identity, trust) {
+        let native_input = match self.prepare_native_input(runtime_role(&config.role)) {
+            Ok(native_input) => native_input,
+            Err(error) => {
+                self.notice = Some(Notice::error(error));
+                return;
+            }
+        };
+        match SessionRuntime::start(config, identity, trust, native_input) {
             Ok(runtime) => {
                 self.session_state = SessionState::default();
                 self.session_runtime = Some(runtime);
@@ -402,6 +451,65 @@ impl DesktopApp {
             runtime.stop();
         }
         self.session_state.stop();
+    }
+
+    fn prepare_native_input(&mut self, role: RuntimeRole) -> Result<NativeInputHost, String> {
+        if let Some(native_input) = self
+            .native_input
+            .as_ref()
+            .filter(|native_input| native_input.role() == role && !native_input.is_finished())
+        {
+            return Ok(native_input.clone());
+        }
+        if !self.report.is_available() {
+            return Err(String::from(
+                "Native desktop input prerequisites are unavailable",
+            ));
+        }
+
+        self.native_input.take();
+        let native_input = NativeInputHost::start(role).map_err(|error| error.to_string())?;
+        tracing::info!(?role, "process native input service started");
+        self.native_input = Some(native_input.clone());
+        self.native_retry_at = None;
+        Ok(native_input)
+    }
+
+    fn poll_native_input(&mut self) {
+        let Some(native_input) = self.native_input.as_ref() else {
+            return;
+        };
+        if self.session_runtime.is_some()
+            || !native_input.is_finished()
+            || !native_input.should_restart_after_close()
+            || self
+                .native_retry_at
+                .is_some_and(|retry_at| retry_at > Instant::now())
+        {
+            return;
+        }
+
+        let role = native_input.role();
+        match NativeInputHost::start(role) {
+            Ok(native_input) => {
+                tracing::warn!(?role, "restarted closed native input service");
+                self.native_input = Some(native_input);
+                self.native_retry_at = None;
+                let config = self
+                    .saved_config
+                    .as_ref()
+                    .filter(|config| runtime_role(&config.role) == role)
+                    .cloned();
+                if let Some(config) = config {
+                    self.start_session(config);
+                }
+            }
+            Err(error) => {
+                tracing::error!(?role, error = %error, "native input service restart failed");
+                self.native_retry_at = Some(Instant::now() + Duration::from_secs(2));
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
     }
 
     fn poll_session(&mut self) {
@@ -796,6 +904,7 @@ impl DesktopApp {
         ui.add_space(26.0);
         ui.label(RichText::new("Role").color(MUTED));
         ui.add_space(6.0);
+        let previous_role = self.config_editor.role;
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.config_editor.role,
@@ -804,6 +913,13 @@ impl DesktopApp {
             );
             ui.selectable_value(&mut self.config_editor.role, ConfigRole::Agent, "Agent");
         });
+        if previous_role != self.config_editor.role {
+            self.stop_session();
+            if let Err(error) = self.prepare_native_input(self.config_editor.role.runtime_role()) {
+                tracing::warn!(%error, "native input role change failed");
+                self.notice = Some(Notice::error(error));
+            }
+        }
 
         ui.add_space(22.0);
         match self.config_editor.role {
@@ -1314,8 +1430,10 @@ impl DesktopApp {
 
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.start_deferred_session(ui.ctx());
         self.poll_discovery();
         self.poll_session();
+        self.poll_native_input();
         if self.identity.is_none() {
             self.setup_view(ui);
             return;
@@ -1335,7 +1453,13 @@ impl eframe::App for DesktopApp {
 }
 
 pub fn run(data_directory: PathBuf, node: Option<NodeId>, logs: LogBuffer) -> Result<(), AppError> {
-    let app = DesktopApp::load(data_directory, node, logs)?;
+    let mut app = DesktopApp::load(data_directory, node, logs)?;
+    if app.native_input.is_none()
+        && let Err(error) = app.prepare_native_input(app.config_editor.role.runtime_role())
+    {
+        tracing::warn!(%error, "native input startup failed");
+        app.notice = Some(Notice::error(error));
+    }
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Tevir")
@@ -1354,6 +1478,13 @@ pub fn run(data_directory: PathBuf, node: Option<NodeId>, logs: LogBuffer) -> Re
         }),
     )
     .map_err(|error| AppError::Desktop(error.to_string()))
+}
+
+const fn runtime_role(role: &Role) -> RuntimeRole {
+    match role {
+        Role::Controller { .. } => RuntimeRole::Controller,
+        Role::Agent { .. } => RuntimeRole::Agent,
+    }
 }
 
 fn load_identity(
@@ -1737,6 +1868,15 @@ impl SessionState {
 enum ConfigRole {
     Controller,
     Agent,
+}
+
+impl ConfigRole {
+    const fn runtime_role(self) -> RuntimeRole {
+        match self {
+            Self::Controller => RuntimeRole::Controller,
+            Self::Agent => RuntimeRole::Agent,
+        }
+    }
 }
 
 struct ConfigEditor {

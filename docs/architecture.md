@@ -67,6 +67,10 @@ release from carrying a contradictory repeat count.
 Native backends run their required event loops on dedicated threads and
 communicate with orchestration through bounded queues. When a focus epoch ends,
 the receiving backend releases all held input before accepting a new epoch.
+The desktop process owns the native service for its selected role, so a Wayland
+portal session is requested during application startup and remains alive across
+network session restarts. Controller capture keeps native edge barriers stable
+for that lifetime and only arms the edges present in the active topology.
 
 ## Platform Boundaries
 
@@ -104,10 +108,12 @@ lower-priority streams. Stream counts, flow-control windows, handshakes,
 frames, operation deadlines, idle timeouts, and reconnect attempts are all
 bounded.
 
-After authentication, an agent reports its configured display dimensions
-before accepting focus or input. The controller reconciles those dimensions
-with the configured screen attachment, publishes the live placement to the
-desktop UI, and sends the resulting focus state to the agent.
+At desktop startup, an agent adopts the current monitor dimensions when the
+window system provides them, falling back to its configured dimensions. After
+authentication, it reports the effective size before accepting focus or input.
+The controller reconciles that size with the configured screen attachment,
+publishes the live placement to the desktop UI, and sends the resulting focus
+state to the agent.
 
 ## Clipboard
 

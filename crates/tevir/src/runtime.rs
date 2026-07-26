@@ -41,13 +41,19 @@ impl SessionRuntime {
         config: Config,
         identity: LocalIdentity,
         trust: TrustStore,
+        native_input: NativeInputHost,
     ) -> Result<Self, RuntimeStartError> {
         validate_trust(&config, &trust)?;
+        if native_input.role() != runtime_role(&config.role) {
+            return Err(RuntimeStartError::NativeRoleMismatch);
+        }
         let (commands, command_rx) = tokio_mpsc::channel(COMMAND_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(EVENT_CAPACITY);
         let worker = thread::Builder::new()
             .name(String::from("tevir-session"))
-            .spawn(move || run_worker(config, identity, trust, command_rx, event_tx))
+            .spawn(move || {
+                run_worker(config, identity, trust, native_input, command_rx, event_tx);
+            })
             .map_err(RuntimeStartError::Spawn)?;
         Ok(Self {
             commands,
@@ -80,6 +86,48 @@ impl Drop for SessionRuntime {
 pub enum RuntimeRole {
     Controller,
     Agent,
+}
+
+#[derive(Clone, Debug)]
+pub enum NativeInputHost {
+    Controller(CaptureService),
+    Agent(InjectionService),
+}
+
+impl NativeInputHost {
+    pub fn start(role: RuntimeRole) -> Result<Self, platform::BackendError> {
+        match role {
+            RuntimeRole::Controller => Ok(Self::Controller(CaptureService::start(&[])?)),
+            RuntimeRole::Agent => Ok(Self::Agent(InjectionService::start()?)),
+        }
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> RuntimeRole {
+        match self {
+            Self::Controller(_) => RuntimeRole::Controller,
+            Self::Agent(_) => RuntimeRole::Agent,
+        }
+    }
+
+    #[must_use]
+    pub fn should_restart_after_close(&self) -> bool {
+        match self {
+            // Capture construction completes before the portal reports whether
+            // permission was granted, so automatic retries could reprompt after
+            // a denial.
+            Self::Controller(_) => false,
+            Self::Agent(injection) => injection.has_been_ready(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        match self {
+            Self::Controller(capture) => capture.is_finished(),
+            Self::Agent(injection) => injection.is_finished(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +206,7 @@ fn run_worker(
     config: Config,
     identity: LocalIdentity,
     trust: TrustStore,
+    native_input: NativeInputHost,
     commands: tokio_mpsc::Receiver<RuntimeCommand>,
     events: SyncSender<RuntimeEvent>,
 ) {
@@ -177,29 +226,43 @@ fn run_worker(
             return;
         }
     };
-    let result = match config.role.clone() {
-        Role::Controller { listen, topology } => runtime.block_on(run_controller(
+    let result = match (config.role.clone(), native_input) {
+        (Role::Controller { listen, topology }, NativeInputHost::Controller(capture)) => {
+            let result = runtime.block_on(run_controller(
+                config.node,
+                listen,
+                topology,
+                identity,
+                trust,
+                capture.clone(),
+                commands,
+                events.clone(),
+            ));
+            let _ = capture.release();
+            let _ = capture.configure(&[]);
+            result
+        }
+        (
+            Role::Agent {
+                controller_node,
+                controller,
+                display_size,
+            },
+            NativeInputHost::Agent(injection),
+        ) => runtime.block_on(run_agent(
             config.node,
-            listen,
-            topology,
+            controller_node,
+            controller,
+            display_size,
             identity,
             trust,
+            injection.clone(),
             commands,
             events.clone(),
         )),
-        Role::Agent {
-            controller_node,
-            controller,
-            display_size,
-        } => runtime.block_on(run_agent(
-            config.node,
-            controller_node,
-            controller,
-            display_size,
-            identity,
-            trust,
-            commands,
-            events.clone(),
+        (Role::Controller { .. }, NativeInputHost::Agent(_))
+        | (Role::Agent { .. }, NativeInputHost::Controller(_)) => Err(RuntimeError::Native(
+            String::from("prepared native input role does not match the configuration"),
         )),
     };
     if let Err(error) = result {
@@ -221,6 +284,7 @@ async fn run_controller(
     mut topology: Topology,
     identity: LocalIdentity,
     trust: TrustStore,
+    capture: CaptureService,
     mut commands: tokio_mpsc::Receiver<RuntimeCommand>,
     events: SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
@@ -240,8 +304,17 @@ async fn run_controller(
     let (mut accepted, accept_worker) = spawn_accept_worker(server);
 
     let edges = capture_edges(&topology, &local_node);
-    let capture =
-        CaptureService::start(&edges).map_err(|error| RuntimeError::Native(error.to_string()))?;
+    capture
+        .configure(&edges)
+        .map_err(|error| RuntimeError::Native(error.to_string()))?;
+    if capture.is_ready() {
+        send_event(
+            &events,
+            RuntimeEvent::NativeReady {
+                backend: capture.backend(),
+            },
+        );
+    }
     let mut controller = ControllerSession::new(topology.clone(), local_node.clone())
         .map_err(|error| RuntimeError::Session(error.to_string()))?;
     send_event(
@@ -663,6 +736,7 @@ async fn run_agent(
     display_size: domain::Size,
     identity: LocalIdentity,
     trust: TrustStore,
+    injection: InjectionService,
     mut commands: tokio_mpsc::Receiver<RuntimeCommand>,
     events: SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
@@ -684,8 +758,14 @@ async fn run_agent(
         SessionLimits::default(),
     )
     .map_err(|error| RuntimeError::Transport(error.to_string()))?;
-    let injection =
-        InjectionService::start().map_err(|error| RuntimeError::Native(error.to_string()))?;
+    if injection.is_ready() {
+        send_event(
+            &events,
+            RuntimeEvent::NativeReady {
+                backend: injection.backend(),
+            },
+        );
+    }
     let reconnect = ReconnectPolicy::default();
     let mut attempt = 0u32;
 
@@ -764,7 +844,6 @@ async fn run_agent(
         }
     }
 
-    let _ = injection.release_all();
     Ok(())
 }
 
@@ -777,6 +856,9 @@ async fn run_agent_connection(
     commands: &mut tokio_mpsc::Receiver<RuntimeCommand>,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<AgentConnectionOutcome, RuntimeError> {
+    let injection_generation = injection
+        .begin_session()
+        .map_err(|error| RuntimeError::Native(error.to_string()))?;
     let (mut sender, receiver) = connection.split_control();
     let (mut inbound, reader_worker) = spawn_control_reader(receiver);
     let mut agent = AgentSession::new(local_node.clone(), display_size);
@@ -800,7 +882,7 @@ async fn run_agent_connection(
             command = commands.recv() => {
                 if command.is_none() || matches!(command, Some(RuntimeCommand::Stop)) {
                     let _ = sender.send(Session::Disconnect).await;
-                    let _ = injection.release_all();
+                    let _ = injection.release_all(injection_generation);
                     break Ok(AgentConnectionOutcome::Stopped);
                 }
             }
@@ -809,11 +891,11 @@ async fn run_agent_connection(
                     Some(ControlReadEvent::Message(message)) => message,
                     Some(ControlReadEvent::Disconnected(reason)) => {
                         tracing::warn!(%reason, "agent control connection ended");
-                        let _ = injection.release_all();
+                        let _ = injection.release_all(injection_generation);
                         break Ok(AgentConnectionOutcome::Disconnected);
                     }
                     None => {
-                        let _ = injection.release_all();
+                        let _ = injection.release_all(injection_generation);
                         break Ok(AgentConnectionOutcome::Disconnected);
                     }
                 };
@@ -823,7 +905,13 @@ async fn run_agent_connection(
                 application_pending = actions
                     .iter()
                     .any(|action| matches!(action, AgentAction::ApplyInput(_)));
-                apply_agent_actions(actions, injection, &mut sender).await?;
+                apply_agent_actions(
+                    actions,
+                    injection,
+                    injection_generation,
+                    &mut sender,
+                )
+                .await?;
                 let next_controlled = agent.active_focus_epoch().is_some();
                 if next_controlled != controlled {
                     controlled = next_controlled;
@@ -839,14 +927,39 @@ async fn run_agent_connection(
                         InjectionServiceEvent::Ready { backend } => {
                             send_event(events, RuntimeEvent::NativeReady { backend });
                         }
-                        InjectionServiceEvent::Applied { sequence } => {
-                            application_pending = false;
-                            let actions = agent
-                                .confirm_applied(sequence)
-                                .map_err(|error| RuntimeError::Session(error.to_string()))?;
-                            apply_agent_actions(actions, injection, &mut sender).await?;
+                        InjectionServiceEvent::Applied {
+                            generation,
+                            sequence,
+                        } => {
+                            if generation == injection_generation {
+                                application_pending = false;
+                                let actions = agent
+                                    .confirm_applied(sequence)
+                                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                                apply_agent_actions(
+                                    actions,
+                                    injection,
+                                    injection_generation,
+                                    &mut sender,
+                                )
+                                .await?;
+                            } else {
+                                tracing::debug!(
+                                    generation,
+                                    active_generation = injection_generation,
+                                    "ignored stale native input event"
+                                );
+                            }
                         }
-                        InjectionServiceEvent::Released => {}
+                        InjectionServiceEvent::Released { generation } => {
+                            if generation != injection_generation {
+                                tracing::debug!(
+                                    generation,
+                                    active_generation = injection_generation,
+                                    "ignored stale native input event"
+                                );
+                            }
+                        }
                         InjectionServiceEvent::Failed { operation, reason } => {
                             break 'session Err(RuntimeError::Native(format!(
                                 "{operation}: {reason}"
@@ -872,18 +985,17 @@ async fn run_agent_connection(
 async fn apply_agent_actions(
     actions: Vec<AgentAction>,
     injection: &InjectionService,
+    injection_generation: u64,
     sender: &mut ControlSender,
 ) -> Result<(), RuntimeError> {
     for action in actions {
         match action {
             AgentAction::FocusEntered { .. } => {}
-            AgentAction::ApplyInput(batch) => {
-                injection
-                    .apply_batch(batch.sequence, batch.events)
-                    .map_err(|error| RuntimeError::Native(error.to_string()))?
-            }
+            AgentAction::ApplyInput(batch) => injection
+                .apply_batch(injection_generation, batch.sequence, batch.events)
+                .map_err(|error| RuntimeError::Native(error.to_string()))?,
             AgentAction::ReleaseAllInput => injection
-                .release_all()
+                .release_all(injection_generation)
                 .map_err(|error| RuntimeError::Native(error.to_string()))?,
             AgentAction::Send(message) => {
                 sender
@@ -1151,8 +1263,17 @@ pub enum RuntimeStartError {
     UntrustedPeer(NodeId),
     #[error("controller topology must contain at least one remote screen")]
     NoRemoteScreens,
+    #[error("prepared native input role does not match the configuration")]
+    NativeRoleMismatch,
     #[error("could not start session worker: {0}")]
     Spawn(std::io::Error),
+}
+
+const fn runtime_role(role: &Role) -> RuntimeRole {
+    match role {
+        Role::Controller { .. } => RuntimeRole::Controller,
+        Role::Agent { .. } => RuntimeRole::Agent,
+    }
 }
 
 #[derive(Debug, Error)]

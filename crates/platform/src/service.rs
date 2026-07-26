@@ -1,6 +1,10 @@
 use std::{
     collections::HashSet,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -17,6 +21,7 @@ use crate::{
 };
 
 const ENGINE_HANDLE: u64 = 1;
+const ALL_CAPTURE_EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
 pub(crate) const COMMAND_QUEUE_CAPACITY: usize = 32;
 pub const SERVICE_QUEUE_CAPACITY: usize = 1024;
 
@@ -54,9 +59,12 @@ pub enum InjectionServiceEvent {
         backend: BackendKind,
     },
     Applied {
+        generation: u64,
         sequence: u64,
     },
-    Released,
+    Released {
+        generation: u64,
+    },
     Failed {
         operation: &'static str,
         reason: String,
@@ -65,28 +73,37 @@ pub enum InjectionServiceEvent {
 }
 
 enum CaptureCommand {
+    Configure(Vec<Edge>),
     Release,
 }
 
 enum InjectionCommand {
+    BeginSession {
+        generation: u64,
+    },
     ApplyBatch {
+        generation: u64,
         sequence: u64,
         events: Vec<InputEvent>,
     },
-    ReleaseAll,
+    ReleaseAll {
+        generation: u64,
+    },
 }
 
+#[derive(Clone)]
 pub struct CaptureService {
-    commands: Option<tokio_mpsc::Sender<CaptureCommand>>,
-    events: Receiver<CaptureServiceEvent>,
-    worker: Option<JoinHandle<()>>,
+    commands: tokio_mpsc::Sender<CaptureCommand>,
+    events: Arc<Mutex<Receiver<CaptureServiceEvent>>>,
+    ready: Arc<AtomicBool>,
+    _worker: Arc<ServiceWorker>,
 }
 
 impl std::fmt::Debug for CaptureService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CaptureService")
-            .field("running", &self.commands.is_some())
+            .field("ready", &self.is_ready())
             .finish_non_exhaustive()
     }
 }
@@ -101,65 +118,85 @@ impl CaptureService {
         );
         let (commands, command_rx) = tokio_mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(SERVICE_QUEUE_CAPACITY);
+        let ready = Arc::new(AtomicBool::new(false));
         let edges = edges.to_vec();
+        let worker_ready = ready.clone();
         let worker = thread::Builder::new()
             .name(String::from("tevir-capture"))
-            .spawn(move || run_local_worker(run_capture(command_rx, event_tx, edges)))
+            .spawn(move || {
+                run_local_worker(run_capture(command_rx, event_tx, edges, worker_ready));
+            })
             .map_err(|error| BackendError::Operation {
                 operation: "start capture worker",
                 reason: error.to_string(),
             })?;
 
         Ok(Self {
-            commands: Some(commands),
-            events,
-            worker: Some(worker),
+            commands,
+            events: Arc::new(Mutex::new(events)),
+            ready,
+            _worker: Arc::new(ServiceWorker::new(worker)),
         })
+    }
+
+    pub fn configure(&self, edges: &[Edge]) -> Result<(), BackendError> {
+        validate_edges(edges)?;
+        self.send(CaptureCommand::Configure(edges.to_vec()))
     }
 
     pub fn release(&self) -> Result<(), BackendError> {
         self.send(CaptureCommand::Release)
     }
 
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self._worker.is_finished()
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> BackendKind {
+        crate::native_capture_kind()
+    }
+
     pub fn try_recv(&self) -> Result<CaptureServiceEvent, TryRecvError> {
-        self.events.try_recv()
+        self.events
+            .lock()
+            .map_or(Err(TryRecvError::Disconnected), |events| events.try_recv())
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureServiceEvent, RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
-    }
-
-    pub fn shutdown(mut self) -> Result<(), BackendError> {
-        self.commands.take();
-        join_worker(self.worker.take())
+        self.events
+            .lock()
+            .map_or(Err(RecvTimeoutError::Disconnected), |events| {
+                events.recv_timeout(timeout)
+            })
     }
 
     fn send(&self, command: CaptureCommand) -> Result<(), BackendError> {
-        self.commands
-            .as_ref()
-            .ok_or(BackendError::WorkerStopped)?
-            .try_send(command)
-            .map_err(map_try_send_error)
+        self.commands.try_send(command).map_err(map_try_send_error)
     }
 }
 
-impl Drop for CaptureService {
-    fn drop(&mut self) {
-        self.commands.take();
-    }
-}
-
+#[derive(Clone)]
 pub struct InjectionService {
-    commands: Option<tokio_mpsc::Sender<InjectionCommand>>,
-    events: Receiver<InjectionServiceEvent>,
-    worker: Option<JoinHandle<()>>,
+    commands: tokio_mpsc::Sender<InjectionCommand>,
+    events: Arc<Mutex<Receiver<InjectionServiceEvent>>>,
+    ready: Arc<AtomicBool>,
+    ever_ready: Arc<AtomicBool>,
+    next_generation: Arc<AtomicU64>,
+    _worker: Arc<ServiceWorker>,
 }
 
 impl std::fmt::Debug for InjectionService {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("InjectionService")
-            .field("running", &self.commands.is_some())
+            .field("ready", &self.is_ready())
             .finish_non_exhaustive()
     }
 }
@@ -172,69 +209,135 @@ impl InjectionService {
         );
         let (commands, command_rx) = tokio_mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (event_tx, events) = mpsc::sync_channel(SERVICE_QUEUE_CAPACITY);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ever_ready = Arc::new(AtomicBool::new(false));
+        let worker_ready = ready.clone();
+        let worker_ever_ready = ever_ready.clone();
         let worker = thread::Builder::new()
             .name(String::from("tevir-injection"))
-            .spawn(move || run_local_worker(run_injection(command_rx, event_tx)))
+            .spawn(move || {
+                run_local_worker(run_injection(
+                    command_rx,
+                    event_tx,
+                    worker_ready,
+                    worker_ever_ready,
+                ));
+            })
             .map_err(|error| BackendError::Operation {
                 operation: "start injection worker",
                 reason: error.to_string(),
             })?;
 
         Ok(Self {
-            commands: Some(commands),
-            events,
-            worker: Some(worker),
+            commands,
+            events: Arc::new(Mutex::new(events)),
+            ready,
+            ever_ready,
+            next_generation: Arc::new(AtomicU64::new(1)),
+            _worker: Arc::new(ServiceWorker::new(worker)),
         })
     }
 
-    pub fn apply_batch(&self, sequence: u64, events: Vec<InputEvent>) -> Result<(), BackendError> {
+    pub fn begin_session(&self) -> Result<u64, BackendError> {
+        let generation = take_injection_generation(&self.next_generation)?;
+        self.send(InjectionCommand::BeginSession { generation })?;
+        Ok(generation)
+    }
+
+    pub fn apply_batch(
+        &self,
+        generation: u64,
+        sequence: u64,
+        events: Vec<InputEvent>,
+    ) -> Result<(), BackendError> {
         if events.is_empty() {
             return Err(BackendError::EmptyInputBatch);
         }
-        self.send(InjectionCommand::ApplyBatch { sequence, events })
+        self.send(InjectionCommand::ApplyBatch {
+            generation,
+            sequence,
+            events,
+        })
     }
 
-    pub fn release_all(&self) -> Result<(), BackendError> {
-        self.send(InjectionCommand::ReleaseAll)
+    pub fn release_all(&self, generation: u64) -> Result<(), BackendError> {
+        self.send(InjectionCommand::ReleaseAll { generation })
+    }
+
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn has_been_ready(&self) -> bool {
+        self.ever_ready.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self._worker.is_finished()
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> BackendKind {
+        crate::native_emulation_kind()
     }
 
     pub fn try_recv(&self) -> Result<InjectionServiceEvent, TryRecvError> {
-        self.events.try_recv()
+        self.events
+            .lock()
+            .map_or(Err(TryRecvError::Disconnected), |events| events.try_recv())
     }
 
     pub fn recv_timeout(
         &self,
         timeout: Duration,
     ) -> Result<InjectionServiceEvent, RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
-    }
-
-    pub fn shutdown(mut self) -> Result<(), BackendError> {
-        self.commands.take();
-        join_worker(self.worker.take())
+        self.events
+            .lock()
+            .map_or(Err(RecvTimeoutError::Disconnected), |events| {
+                events.recv_timeout(timeout)
+            })
     }
 
     fn send(&self, command: InjectionCommand) -> Result<(), BackendError> {
-        self.commands
-            .as_ref()
-            .ok_or(BackendError::WorkerStopped)?
-            .try_send(command)
-            .map_err(map_try_send_error)
+        self.commands.try_send(command).map_err(map_try_send_error)
     }
 }
 
-impl Drop for InjectionService {
+struct ServiceWorker {
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ServiceWorker {
+    fn new(worker: JoinHandle<()>) -> Self {
+        Self {
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.worker.lock().map_or(true, |worker| {
+            worker.as_ref().is_none_or(JoinHandle::is_finished)
+        })
+    }
+}
+
+impl Drop for ServiceWorker {
     fn drop(&mut self) {
-        self.commands.take();
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if worker.is_some_and(|worker| worker.join().is_err()) {
+            tracing::error!("native input service worker panicked");
+        }
     }
 }
 
 fn validate_edges(edges: &[Edge]) -> Result<(), BackendError> {
-    if edges.is_empty() {
-        return Err(BackendError::Unavailable {
-            reason: String::from("at least one capture edge is required"),
-        });
-    }
     let unique: HashSet<Edge> = edges.iter().copied().collect();
     if unique.len() != edges.len() {
         return Err(BackendError::Unavailable {
@@ -242,6 +345,13 @@ fn validate_edges(edges: &[Edge]) -> Result<(), BackendError> {
         });
     }
     Ok(())
+}
+
+fn take_injection_generation(next: &AtomicU64) -> Result<u64, BackendError> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+        generation.checked_add(1)
+    })
+    .map_err(|_| BackendError::SessionGenerationExhausted)
 }
 
 pub(crate) fn map_try_send_error<T>(error: tokio_mpsc::error::TrySendError<T>) -> BackendError {
@@ -273,6 +383,7 @@ async fn run_capture(
     mut commands: tokio_mpsc::Receiver<CaptureCommand>,
     events: SyncSender<CaptureServiceEvent>,
     edges: Vec<Edge>,
+    ready: Arc<AtomicBool>,
 ) {
     let mut capture =
         match capture_engine::InputCapture::new(Some(crate::native_capture_backend())).await {
@@ -283,8 +394,8 @@ async fn run_capture(
             }
         };
 
-    for (index, edge) in edges.iter().copied().enumerate() {
-        let handle = index as u64 + 1;
+    for edge in ALL_CAPTURE_EDGES {
+        let handle = capture_handle(edge);
         if let Err(error) = capture
             .create(handle, capture_position_from_edge(edge))
             .await
@@ -304,14 +415,33 @@ async fn run_capture(
         let _ = capture.terminate().await;
         return;
     }
+    ready.store(true, Ordering::Release);
     tracing::info!(backend = ?crate::native_capture_kind(), "input capture service ready");
 
+    let mut enabled_edges: HashSet<Edge> = edges.into_iter().collect();
     let mut held = HeldInput::default();
+    let mut accepting_input = false;
     loop {
         tokio::select! {
             command = commands.recv() => {
                 match command {
+                    Some(CaptureCommand::Configure(edges)) => {
+                        let configured: HashSet<Edge> = edges.into_iter().collect();
+                        if configured != enabled_edges {
+                            accepting_input = false;
+                            emit_capture_releases(&events, &mut held);
+                            if let Err(error) = capture.release().await {
+                                send_capture_failure(&events, "release capture", &error);
+                            }
+                            enabled_edges = configured;
+                            tracing::info!(
+                                edges = enabled_edges.len(),
+                                "input capture edges configured"
+                            );
+                        }
+                    }
                     Some(CaptureCommand::Release) => {
+                        accepting_input = false;
                         emit_capture_releases(&events, &mut held);
                         if let Err(error) = capture.release().await {
                             send_capture_failure(&events, "release capture", &error);
@@ -332,13 +462,30 @@ async fn run_capture(
                 };
                 match native {
                     Ok((handle, capture_engine::CaptureEvent::Begin)) => {
-                        if let Some(edge) = edges.get(handle.saturating_sub(1) as usize)
-                            && events.send(CaptureServiceEvent::Activated { edge: *edge }).is_err()
-                        {
-                            break;
+                        let Some(edge) = capture_edge(handle) else {
+                            send_capture_failure(
+                                &events,
+                                "activate capture edge",
+                                &format_args!("unknown capture handle {handle}"),
+                            );
+                            continue;
+                        };
+                        if enabled_edges.contains(&edge) {
+                            accepting_input = true;
+                            if events.send(CaptureServiceEvent::Activated { edge }).is_err() {
+                                break;
+                            }
+                        } else {
+                            accepting_input = false;
+                            if let Err(error) = capture.release().await {
+                                send_capture_failure(&events, "release unarmed capture", &error);
+                            }
                         }
                     }
                     Ok((_, capture_engine::CaptureEvent::Input(native))) => {
+                        if !accepting_input {
+                            continue;
+                        }
                         match from_native(native) {
                             Ok(Some(event)) => {
                                 held.observe(event);
@@ -366,6 +513,7 @@ async fn run_capture(
     emit_capture_releases(&events, &mut held);
     let _ = capture.release().await;
     let _ = capture.terminate().await;
+    ready.store(false, Ordering::Release);
     let _ = events.send(CaptureServiceEvent::Stopped);
     tracing::info!("input capture service stopped");
 }
@@ -381,6 +529,8 @@ fn emit_capture_releases(events: &SyncSender<CaptureServiceEvent>, held: &mut He
 async fn run_injection(
     mut commands: tokio_mpsc::Receiver<InjectionCommand>,
     events: SyncSender<InjectionServiceEvent>,
+    ready: Arc<AtomicBool>,
+    ever_ready: Arc<AtomicBool>,
 ) {
     let mut injection = match emulation_engine::InputEmulation::new(Some(
         crate::native_emulation_backend(),
@@ -403,18 +553,34 @@ async fn run_injection(
         injection.terminate().await;
         return;
     }
+    ready.store(true, Ordering::Release);
+    ever_ready.store(true, Ordering::Release);
     tracing::info!(
         backend = ?crate::native_emulation_kind(),
         "input injection service ready"
     );
 
     let mut held = HeldInput::default();
+    let mut active_generation = 0;
     'commands: while let Some(command) = commands.recv().await {
         match command {
+            InjectionCommand::BeginSession { generation } => {
+                release_injected_input(&mut injection, &events, &mut held, active_generation).await;
+                active_generation = generation;
+            }
             InjectionCommand::ApplyBatch {
+                generation,
                 sequence,
                 events: batch,
             } => {
+                if generation != active_generation {
+                    tracing::debug!(
+                        generation,
+                        active_generation,
+                        "discarded stale native input batch"
+                    );
+                    continue;
+                }
                 let mut applied = true;
                 for event in batch {
                     match to_native(event) {
@@ -434,21 +600,28 @@ async fn run_injection(
                 }
                 if applied
                     && events
-                        .send(InjectionServiceEvent::Applied { sequence })
+                        .send(InjectionServiceEvent::Applied {
+                            generation,
+                            sequence,
+                        })
                         .is_err()
                 {
                     break 'commands;
                 }
             }
-            InjectionCommand::ReleaseAll => {
-                release_injected_input(&mut injection, &events, &mut held).await;
+            InjectionCommand::ReleaseAll { generation } => {
+                if generation == active_generation {
+                    release_injected_input(&mut injection, &events, &mut held, active_generation)
+                        .await;
+                }
             }
         }
     }
 
-    release_injected_input(&mut injection, &events, &mut held).await;
+    release_injected_input(&mut injection, &events, &mut held, active_generation).await;
     injection.destroy(ENGINE_HANDLE).await;
     injection.terminate().await;
+    ready.store(false, Ordering::Release);
     let _ = events.send(InjectionServiceEvent::Stopped);
     tracing::info!("input injection service stopped");
 }
@@ -457,6 +630,7 @@ async fn release_injected_input(
     injection: &mut emulation_engine::InputEmulation,
     events: &SyncSender<InjectionServiceEvent>,
     held: &mut HeldInput,
+    generation: u64,
 ) {
     for release in held.release_all(0) {
         match to_native(release) {
@@ -471,7 +645,7 @@ async fn release_injected_input(
     if let Err(error) = injection.release_keys(ENGINE_HANDLE).await {
         send_injection_failure(events, "release held keys", &error);
     }
-    let _ = events.send(InjectionServiceEvent::Released);
+    let _ = events.send(InjectionServiceEvent::Released { generation });
 }
 
 fn send_capture_failure(
@@ -507,16 +681,59 @@ const fn capture_position_from_edge(edge: Edge) -> capture_engine::Position {
     }
 }
 
+const fn capture_handle(edge: Edge) -> u64 {
+    match edge {
+        Edge::Left => 1,
+        Edge::Right => 2,
+        Edge::Top => 3,
+        Edge::Bottom => 4,
+    }
+}
+
+const fn capture_edge(handle: u64) -> Option<Edge> {
+    match handle {
+        1 => Some(Edge::Left),
+        2 => Some(Edge::Right),
+        3 => Some(Edge::Top),
+        4 => Some(Edge::Bottom),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use domain::Edge;
 
-    use super::validate_edges;
+    use super::{
+        ALL_CAPTURE_EDGES, capture_edge, capture_handle, take_injection_generation, validate_edges,
+    };
+    use crate::BackendError;
 
     #[test]
-    fn capture_edges_must_be_nonempty_and_unique() {
-        assert!(validate_edges(&[]).is_err());
+    fn capture_edges_may_be_idle_but_must_be_unique() {
+        assert!(validate_edges(&[]).is_ok());
         assert!(validate_edges(&[Edge::Left, Edge::Left]).is_err());
         assert!(validate_edges(&[Edge::Left, Edge::Right]).is_ok());
+    }
+
+    #[test]
+    fn native_capture_handles_are_stable_for_every_edge() {
+        for edge in ALL_CAPTURE_EDGES {
+            assert_eq!(capture_edge(capture_handle(edge)), Some(edge));
+        }
+        assert_eq!(capture_edge(0), None);
+        assert_eq!(capture_edge(5), None);
+    }
+
+    #[test]
+    fn native_session_generations_do_not_wrap() {
+        let next = AtomicU64::new(u64::MAX);
+
+        assert!(matches!(
+            take_injection_generation(&next),
+            Err(BackendError::SessionGenerationExhausted)
+        ));
     }
 }
