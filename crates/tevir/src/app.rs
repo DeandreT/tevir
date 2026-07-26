@@ -903,7 +903,7 @@ impl DesktopApp {
             .frame(
                 Frame::new()
                     .fill(CANVAS)
-                    .inner_margin(Margin::symmetric(28, 22)),
+                    .inner_margin(Margin::symmetric(22, 16)),
             )
             .show(root, |ui| {
                 if let Some(notice) = self.notice.as_ref() {
@@ -921,6 +921,19 @@ impl DesktopApp {
     }
 
     fn status_view(&mut self, ui: &mut Ui) {
+        if ui.available_width() >= 800.0 {
+            ui.columns(2, |columns| {
+                self.live_session_view(&mut columns[0]);
+                self.session_readiness_view(&mut columns[1]);
+            });
+        } else {
+            self.live_session_view(ui);
+            ui.add_space(22.0);
+            self.session_readiness_view(ui);
+        }
+    }
+
+    fn live_session_view(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             section_heading(ui, "Live session", self.session_state.role_label());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1060,14 +1073,15 @@ impl DesktopApp {
             ui.add_space(8.0);
             status_label(ui, error, DANGER);
         }
+    }
 
-        ui.add_space(30.0);
+    fn session_readiness_view(&mut self, ui: &mut Ui) {
         section_heading(
             ui,
             "Session readiness",
             "Local prerequisites and trusted nodes",
         );
-        ui.add_space(14.0);
+        ui.add_space(10.0);
         let platform_ready = self.report.is_available();
         metric_row(
             ui,
@@ -1114,9 +1128,9 @@ impl DesktopApp {
             },
         );
 
-        ui.add_space(30.0);
+        ui.add_space(22.0);
         section_heading(ui, "Configuration", "Controller or agent");
-        ui.add_space(14.0);
+        ui.add_space(10.0);
         if let Some(summary) = self.config_summary.as_ref() {
             ui.label(RichText::new(summary).color(SUCCESS));
             ui.add_space(10.0);
@@ -1154,11 +1168,11 @@ impl DesktopApp {
             }
         });
 
-        ui.add_space(26.0);
-        ui.label(RichText::new("Role").color(MUTED));
-        ui.add_space(6.0);
+        ui.add_space(16.0);
         let previous_role = self.config_editor.role;
         ui.horizontal(|ui| {
+            ui.label(RichText::new("Role").color(MUTED));
+            ui.add_space(8.0);
             ui.selectable_value(
                 &mut self.config_editor.role,
                 ConfigRole::Controller,
@@ -1177,7 +1191,7 @@ impl DesktopApp {
             }
         }
 
-        ui.add_space(22.0);
+        ui.add_space(14.0);
         match self.config_editor.role {
             ConfigRole::Controller => self.controller_configuration(ui),
             ConfigRole::Agent => self.agent_configuration(ui),
@@ -1334,16 +1348,29 @@ impl DesktopApp {
     }
 
     fn controller_configuration(&mut self, ui: &mut Ui) {
-        section_heading(ui, "Listen endpoint", "IP address and port");
-        ui.add_space(10.0);
-        labeled_text_field(
-            ui,
-            "Listen address",
-            &mut self.config_editor.listen_address,
-            "0.0.0.0:24800",
-        );
+        if ui.available_width() >= 600.0 {
+            ui.horizontal(|ui| {
+                section_heading(ui, "Listen endpoint", "IP address and port");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_sized(
+                        [320.0, 34.0],
+                        singleline_text(&mut self.config_editor.listen_address)
+                            .hint_text("0.0.0.0:24800"),
+                    );
+                });
+            });
+        } else {
+            section_heading(ui, "Listen endpoint", "IP address and port");
+            ui.add_space(8.0);
+            labeled_text_field(
+                ui,
+                "Listen address",
+                &mut self.config_editor.listen_address,
+                "0.0.0.0:24800",
+            );
+        }
 
-        ui.add_space(26.0);
+        ui.add_space(18.0);
         let mut add_screen = false;
         ui.horizontal(|ui| {
             section_heading(
@@ -1381,16 +1408,86 @@ impl DesktopApp {
             self.config_editor.add_screen(suggested_node);
         }
         let local_node = self.identity.as_ref().map(LocalIdentity::node).cloned();
-        topology_canvas(ui, &mut self.config_editor, local_node.as_ref());
-        ui.add_space(12.0);
+        if ui.available_width() >= 800.0 {
+            ui.columns(2, |columns| {
+                topology_canvas(
+                    &mut columns[0],
+                    &mut self.config_editor,
+                    local_node.as_ref(),
+                );
+                self.selected_machine_editor(&mut columns[1], local_node.as_ref());
+            });
+        } else {
+            topology_canvas(ui, &mut self.config_editor, local_node.as_ref());
+            ui.add_space(10.0);
+            self.selected_machine_editor(ui, local_node.as_ref());
+        }
 
+        ui.add_space(22.0);
+        section_heading(ui, "Edge switching", "Controller capture behavior");
+        ui.add_space(8.0);
+        ui.columns(2, |columns| {
+            columns[0].label(RichText::new("Switch delay").color(MUTED));
+            columns[0].add(
+                egui::Slider::new(
+                    &mut self.config_editor.edge_behavior.switch_delay_ms,
+                    0..=2_000,
+                )
+                .suffix(" ms"),
+            );
+            columns[1].label(RichText::new("Corner dead zone").color(MUTED));
+            columns[1].add(
+                egui::Slider::new(
+                    &mut self.config_editor.edge_behavior.corner_dead_zone_percent,
+                    0..=25,
+                )
+                .suffix("%"),
+            );
+        });
+        ui.add_space(6.0);
+        egui::Grid::new("edge-behavior-grid")
+            .num_columns(4)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Edge").color(MUTED));
+                ui.label(RichText::new("Enabled").color(MUTED));
+                ui.label(RichText::new("Active start").color(MUTED));
+                ui.label(RichText::new("Active end").color(MUTED));
+                ui.end_row();
+                for (edge, label) in [
+                    (domain::Edge::Left, "Left"),
+                    (domain::Edge::Right, "Right"),
+                    (domain::Edge::Top, "Top"),
+                    (domain::Edge::Bottom, "Bottom"),
+                ] {
+                    let rule = self.config_editor.edge_behavior.rule_mut(edge);
+                    ui.label(label);
+                    ui.checkbox(&mut rule.enabled, "");
+                    let maximum_start = rule.active_end_percent.saturating_sub(1);
+                    ui.add_enabled(
+                        rule.enabled,
+                        egui::Slider::new(&mut rule.active_start_percent, 0..=maximum_start)
+                            .suffix("%"),
+                    );
+                    let minimum_end = rule.active_start_percent.saturating_add(1);
+                    ui.add_enabled(
+                        rule.enabled,
+                        egui::Slider::new(&mut rule.active_end_percent, minimum_end..=100)
+                            .suffix("%"),
+                    );
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn selected_machine_editor(&mut self, ui: &mut Ui, local_node: Option<&NodeId>) {
         let selected = self
             .config_editor
             .selected_screen
             .min(self.config_editor.screens.len().saturating_sub(1));
         self.config_editor.selected_screen = selected;
         let can_remove = self.config_editor.can_remove_screen(selected)
-            && local_node.as_ref().is_none_or(|local| {
+            && local_node.is_none_or(|local| {
                 self.config_editor.screens[selected].node.trim() != local.as_str()
             });
         let mut remove_selected = false;
@@ -1481,62 +1578,6 @@ impl DesktopApp {
         if remove_selected {
             self.config_editor.remove_selected();
         }
-
-        ui.add_space(26.0);
-        section_heading(ui, "Edge switching", "Controller capture behavior");
-        ui.add_space(10.0);
-        ui.columns(2, |columns| {
-            columns[0].label(RichText::new("Switch delay").color(MUTED));
-            columns[0].add(
-                egui::Slider::new(
-                    &mut self.config_editor.edge_behavior.switch_delay_ms,
-                    0..=2_000,
-                )
-                .suffix(" ms"),
-            );
-            columns[1].label(RichText::new("Corner dead zone").color(MUTED));
-            columns[1].add(
-                egui::Slider::new(
-                    &mut self.config_editor.edge_behavior.corner_dead_zone_percent,
-                    0..=25,
-                )
-                .suffix("%"),
-            );
-        });
-        ui.add_space(8.0);
-        egui::Grid::new("edge-behavior-grid")
-            .num_columns(4)
-            .spacing([14.0, 8.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Edge").color(MUTED));
-                ui.label(RichText::new("Enabled").color(MUTED));
-                ui.label(RichText::new("Active start").color(MUTED));
-                ui.label(RichText::new("Active end").color(MUTED));
-                ui.end_row();
-                for (edge, label) in [
-                    (domain::Edge::Left, "Left"),
-                    (domain::Edge::Right, "Right"),
-                    (domain::Edge::Top, "Top"),
-                    (domain::Edge::Bottom, "Bottom"),
-                ] {
-                    let rule = self.config_editor.edge_behavior.rule_mut(edge);
-                    ui.label(label);
-                    ui.checkbox(&mut rule.enabled, "");
-                    let maximum_start = rule.active_end_percent.saturating_sub(1);
-                    ui.add_enabled(
-                        rule.enabled,
-                        egui::Slider::new(&mut rule.active_start_percent, 0..=maximum_start)
-                            .suffix("%"),
-                    );
-                    let minimum_end = rule.active_start_percent.saturating_add(1);
-                    ui.add_enabled(
-                        rule.enabled,
-                        egui::Slider::new(&mut rule.active_end_percent, minimum_end..=100)
-                            .suffix("%"),
-                    );
-                    ui.end_row();
-                }
-            });
     }
 
     fn pairing_view(&mut self, ui: &mut Ui) {
@@ -1546,12 +1587,26 @@ impl DesktopApp {
         let bundle = identity.pairing_bundle();
         let encoded = bundle.encode();
         let code = bundle.code().to_string();
+        let node = identity.node().to_string();
 
-        section_heading(ui, "This node", identity.node().as_str());
-        ui.add_space(12.0);
+        if ui.available_width() >= 800.0 {
+            ui.columns(2, |columns| {
+                self.pairing_discovery_view(&mut columns[0], &node, &encoded, &code);
+                self.pairing_trust_view(&mut columns[1]);
+            });
+        } else {
+            self.pairing_discovery_view(ui, &node, &encoded, &code);
+            ui.add_space(22.0);
+            self.pairing_trust_view(ui);
+        }
+    }
+
+    fn pairing_discovery_view(&mut self, ui: &mut Ui, node: &str, encoded: &str, code: &str) {
+        section_heading(ui, "This node", node);
+        ui.add_space(10.0);
         ui.label(RichText::new("Verification code").color(MUTED));
         ui.label(
-            RichText::new(&code)
+            RichText::new(code)
                 .family(FontFamily::Monospace)
                 .size(20.0)
                 .color(TEXT),
@@ -1559,16 +1614,16 @@ impl DesktopApp {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("Copy bundle").clicked() {
-                ui.ctx().copy_text(encoded.clone());
+                ui.ctx().copy_text(encoded.to_owned());
                 self.notice = Some(Notice::success("Pairing bundle copied"));
             }
             if ui.button("Copy code").clicked() {
-                ui.ctx().copy_text(code.clone());
+                ui.ctx().copy_text(code.to_owned());
                 self.notice = Some(Notice::success("Verification code copied"));
             }
         });
 
-        ui.add_space(30.0);
+        ui.add_space(22.0);
         section_heading(ui, "Nearby nodes", &format!("{} found", self.nearby.len()));
         ui.add_space(10.0);
         if let Some(error) = self.discovery_error.as_ref() {
@@ -1630,16 +1685,17 @@ impl DesktopApp {
             }
             ui.add_space(8.0);
         }
+    }
 
-        ui.add_space(22.0);
+    fn pairing_trust_view(&mut self, ui: &mut Ui) {
         section_heading(
             ui,
             "Add trusted node",
             "Pairing bundle and verification code",
         );
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.add_sized(
-            [ui.available_width(), 82.0],
+            [ui.available_width(), 70.0],
             TextEdit::multiline(&mut self.pairing_bundle_input)
                 .hint_text("Pairing bundle")
                 .font(TextStyle::Monospace),
@@ -1666,7 +1722,7 @@ impl DesktopApp {
             }
         });
 
-        ui.add_space(30.0);
+        ui.add_space(22.0);
         section_heading(
             ui,
             "Trusted nodes",
@@ -1725,6 +1781,19 @@ impl DesktopApp {
     }
 
     fn diagnostics_view(&mut self, ui: &mut Ui) {
+        if ui.available_width() >= 800.0 {
+            ui.columns(2, |columns| {
+                self.connection_diagnostics_view(&mut columns[0]);
+                self.environment_diagnostics_view(&mut columns[1]);
+            });
+        } else {
+            self.connection_diagnostics_view(ui);
+            ui.add_space(22.0);
+            self.environment_diagnostics_view(ui);
+        }
+    }
+
+    fn connection_diagnostics_view(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             section_heading(ui, "Live connection", "Heartbeat and input delivery");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1823,8 +1892,9 @@ impl DesktopApp {
                 });
             ui.add_space(8.0);
         }
+    }
 
-        ui.add_space(24.0);
+    fn environment_diagnostics_view(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             section_heading(ui, "Desktop environment", "Native input prerequisites");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1839,7 +1909,7 @@ impl DesktopApp {
                 }
             });
         });
-        ui.add_space(16.0);
+        ui.add_space(10.0);
         metric_row(
             ui,
             "Platform",
@@ -1864,7 +1934,7 @@ impl DesktopApp {
         );
         let (native_label, native_color) = self.native_input_status();
         metric_row(ui, "Native permission", native_label, native_color);
-        ui.add_space(24.0);
+        ui.add_space(22.0);
         section_heading(
             ui,
             "Issues",
@@ -1903,7 +1973,7 @@ impl DesktopApp {
             empty_state(ui, "No events recorded");
             return;
         }
-        for entry in entries {
+        for entry in entries.into_iter().rev() {
             log_row(ui, &entry);
         }
     }
@@ -2075,30 +2145,22 @@ fn section_heading(ui: &mut Ui, title: &str, detail: &str) {
 }
 
 fn metric_row(ui: &mut Ui, label: &str, value: &str, color: Color32) {
-    let response = ui.allocate_response(Vec2::new(ui.available_width(), 42.0), Sense::hover());
-    let painter = ui.painter_at(response.rect);
-    painter.line_segment(
-        [response.rect.left_bottom(), response.rect.right_bottom()],
+    let response = ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 34.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(RichText::new(label).color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(value).color(TEXT));
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color);
+            });
+        },
+    );
+    ui.painter().hline(
+        response.response.rect.x_range(),
+        response.response.rect.bottom(),
         Stroke::new(1.0, BORDER),
-    );
-    painter.text(
-        response.rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        label,
-        FontId::new(14.0, FontFamily::Proportional),
-        MUTED,
-    );
-    painter.circle_filled(
-        egui::pos2(response.rect.right() - 110.0, response.rect.center().y),
-        4.0,
-        color,
-    );
-    painter.text(
-        response.rect.right_center(),
-        egui::Align2::RIGHT_CENTER,
-        value,
-        FontId::new(14.0, FontFamily::Proportional),
-        TEXT,
     );
 }
 
@@ -3118,7 +3180,7 @@ impl ScreenEditor {
 
 fn topology_canvas(ui: &mut Ui, editor: &mut ConfigEditor, local_node: Option<&NodeId>) {
     let (canvas, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 280.0), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 240.0), Sense::hover());
     let painter = ui.painter_at(canvas);
     painter.rect_filled(canvas, CornerRadius::same(5), CANVAS);
     painter.rect_stroke(
