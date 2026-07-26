@@ -1033,14 +1033,14 @@ mod platform {
                     let edge = capture_edge(handle).ok_or_else(|| {
                         NativeInputError::message(format!("unknown capture handle {handle}"))
                     });
-                    edge.and_then(|edge| {
+                    edge.map(|edge| {
                         let edge_position = self.cursor.location().ok().and_then(|position| {
                             normalized_windows_position(&self.cursor, edge, position)
                         });
-                        Ok(NativeCaptureEvent::Activated {
+                        NativeCaptureEvent::Activated {
                             edge,
                             edge_position,
-                        })
+                        }
                     })
                 }
                 Ok((_, capture_engine::CaptureEvent::Input(event))) => {
