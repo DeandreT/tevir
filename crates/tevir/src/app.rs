@@ -2791,21 +2791,44 @@ fn saturating_f64_to_i32(value: f64) -> i32 {
 
 fn desktop_geometry(frame: &eframe::Frame) -> Option<platform::DesktopGeometry> {
     let window = frame.winit_window()?;
-    let monitors = window.available_monitors().collect::<Vec<_>>();
-    let first = monitors.first()?;
-    let first_position = first.position();
-    let first_size = first.size();
-    let mut left = i64::from(first_position.x);
-    let mut top = i64::from(first_position.y);
-    let mut right = left + i64::from(first_size.width);
-    let mut bottom = top + i64::from(first_size.height);
-    for monitor in &monitors[1..] {
+    aggregate_monitor_geometry(window.available_monitors().map(|monitor| {
         let position = monitor.position();
         let size = monitor.size();
-        left = left.min(i64::from(position.x));
-        top = top.min(i64::from(position.y));
-        right = right.max(i64::from(position.x) + i64::from(size.width));
-        bottom = bottom.max(i64::from(position.y) + i64::from(size.height));
+        MonitorGeometry {
+            name: monitor.name(),
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        }
+    }))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MonitorGeometry {
+    name: Option<String>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn aggregate_monitor_geometry(
+    monitors: impl IntoIterator<Item = MonitorGeometry>,
+) -> Option<platform::DesktopGeometry> {
+    let mut monitors = monitors.into_iter().collect::<Vec<_>>();
+    monitors.sort_unstable();
+    monitors.dedup();
+    let first = monitors.first()?;
+    let mut left = i64::from(first.x);
+    let mut top = i64::from(first.y);
+    let mut right = left + i64::from(first.width);
+    let mut bottom = top + i64::from(first.height);
+    for monitor in &monitors[1..] {
+        left = left.min(i64::from(monitor.x));
+        top = top.min(i64::from(monitor.y));
+        right = right.max(i64::from(monitor.x) + i64::from(monitor.width));
+        bottom = bottom.max(i64::from(monitor.y) + i64::from(monitor.height));
     }
     let width = u32::try_from(right.checked_sub(left)?).ok()?;
     let height = u32::try_from(bottom.checked_sub(top)?).ok()?;
@@ -2929,9 +2952,34 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ConfigEditor, ConfigRole, DesktopApp, RemoteDisplay, RuntimeEvent, RuntimeRole,
-        ScreenEditor, ScreenGeometry, SessionState,
+        ConfigEditor, ConfigRole, DesktopApp, MonitorGeometry, RemoteDisplay, RuntimeEvent,
+        RuntimeRole, ScreenEditor, ScreenGeometry, SessionState, aggregate_monitor_geometry,
     };
+
+    #[test]
+    fn desktop_geometry_deduplicates_wayland_output_handles() {
+        let monitor = |name: &str, x| MonitorGeometry {
+            name: Some(name.to_owned()),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let geometry = aggregate_monitor_geometry([
+            monitor("HDMI-A-1", 0),
+            monitor("DP-1", 1920),
+            monitor("DP-2", 3840),
+            monitor("HDMI-A-1", 0),
+            monitor("DP-1", 1920),
+            monitor("DP-2", 3840),
+        ])
+        .unwrap_or_else(|| panic!("monitor geometry should aggregate"));
+
+        assert_eq!(geometry.origin, Point { x: 0, y: 0 });
+        assert_eq!(geometry.size.width.get(), 5760);
+        assert_eq!(geometry.size.height.get(), 1080);
+        assert_eq!(geometry.monitor_count, 3);
+    }
 
     #[test]
     fn node_override_initializes_the_desktop_identity() {
