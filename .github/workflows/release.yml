@@ -56,7 +56,7 @@ jobs:
           "$hash  ${{ matrix.artifact }}.zip" |
             Out-File "dist/${{ matrix.artifact }}.zip.sha256" -Encoding ascii
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/*
