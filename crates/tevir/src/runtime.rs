@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Topology};
+use domain::{
+    DesktopLayout, Edge, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point, Rect,
+    ScreenPlacement, Topology,
+};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
     BackendKind, CaptureService, CaptureServiceEvent, ClipboardService, ClipboardServiceEvent,
@@ -84,6 +87,12 @@ impl SessionRuntime {
                 topology,
                 edge_behavior,
             })
+            .map_err(|_| RuntimeCommandError)
+    }
+
+    pub fn return_control(&self) -> Result<(), RuntimeCommandError> {
+        self.commands
+            .try_send(RuntimeCommand::ReturnLocal)
             .map_err(|_| RuntimeCommandError)
     }
 
@@ -204,6 +213,7 @@ pub enum RuntimeEvent {
 
 enum RuntimeCommand {
     Stop,
+    ReturnLocal,
     ReconfigureController {
         topology: Topology,
         edge_behavior: EdgeBehavior,
@@ -402,6 +412,7 @@ async fn run_controller(
     let mut edge_state = EdgeState {
         behavior: edge_behavior,
         pending_activation: None,
+        emergency_shortcut: EmergencyShortcut::default(),
     };
 
     loop {
@@ -409,6 +420,17 @@ async fn run_controller(
             command = commands.recv() => {
                 match command {
                     None | Some(RuntimeCommand::Stop) => break,
+                    Some(RuntimeCommand::ReturnLocal) => {
+                        edge_state.pending_activation = None;
+                        let actions = controller
+                            .return_to_local()
+                            .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                        apply_controller_actions(actions, &capture, &peers, &events)?;
+                        send_event(&events, RuntimeEvent::FocusChanged {
+                            node: controller.focus().clone(),
+                        });
+                        tracing::info!("control returned to the controller");
+                    }
                     Some(RuntimeCommand::ReconfigureController {
                         topology: updated,
                         edge_behavior: updated_behavior,
@@ -705,6 +727,21 @@ fn drain_capture_events(
                 send_event(events, RuntimeEvent::LocalDesktopChanged { geometry });
             }
             CaptureServiceEvent::Input(event) => {
+                if edge_state.emergency_shortcut.observe(event) {
+                    edge_state.pending_activation = None;
+                    let actions = controller
+                        .return_to_local()
+                        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                    apply_controller_actions(actions, capture, peers, events)?;
+                    send_event(
+                        events,
+                        RuntimeEvent::FocusChanged {
+                            node: controller.focus().clone(),
+                        },
+                    );
+                    tracing::info!("emergency shortcut returned control to the controller");
+                    continue;
+                }
                 if edge_state.pending_activation.is_some() {
                     continue;
                 }
@@ -2126,7 +2163,36 @@ struct PendingActivation {
 struct EdgeState {
     behavior: EdgeBehavior,
     pending_activation: Option<PendingActivation>,
+    emergency_shortcut: EmergencyShortcut,
 }
+
+#[derive(Default)]
+struct EmergencyShortcut {
+    control: bool,
+    alt: bool,
+}
+
+impl EmergencyShortcut {
+    fn observe(&mut self, event: InputEvent) -> bool {
+        let InputKind::Key { key, action } = event.kind else {
+            return false;
+        };
+        let pressed = !matches!(action, KeyAction::Release);
+        match key {
+            LEFT_CONTROL | RIGHT_CONTROL => self.control = pressed,
+            LEFT_ALT | RIGHT_ALT => self.alt = pressed,
+            ESCAPE if matches!(action, KeyAction::Press) => return self.control && self.alt,
+            _ => {}
+        }
+        false
+    }
+}
+
+const LEFT_CONTROL: PhysicalKey = PhysicalKey::new(0x07, 0xe0);
+const RIGHT_CONTROL: PhysicalKey = PhysicalKey::new(0x07, 0xe4);
+const LEFT_ALT: PhysicalKey = PhysicalKey::new(0x07, 0xe2);
+const RIGHT_ALT: PhysicalKey = PhysicalKey::new(0x07, 0xe6);
+const ESCAPE: PhysicalKey = PhysicalKey::new(0x07, 0x29);
 
 enum ControlReadEvent {
     Message(Session),
@@ -2203,7 +2269,10 @@ mod tests {
         time::Duration,
     };
 
-    use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+    use domain::{
+        DesktopLayout, Edge, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point, Rect,
+        ScreenPlacement, Size, Topology,
+    };
     use identity::{IdentityStore, LocalIdentity, TrustStore};
     use protocol::Session;
     use tempfile::TempDir;
@@ -2211,9 +2280,19 @@ mod tests {
     use transport::{SecureClient, SecureServer, SessionLimits};
 
     use super::{
-        NETWORK_EVENT_CAPACITY, NetworkEvent, activation_target, capture_edges,
+        EmergencyShortcut, NETWORK_EVENT_CAPACITY, NetworkEvent, activation_target, capture_edges,
         resize_topology_screen, session_profile, spawn_accept_worker, spawn_connection_worker,
     };
+
+    fn key_event(usage_id: u16, action: KeyAction) -> InputEvent {
+        InputEvent {
+            elapsed_micros: 0,
+            kind: InputKind::Key {
+                key: PhysicalKey::new(0x07, usage_id),
+                action,
+            },
+        }
+    }
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
@@ -2309,6 +2388,18 @@ mod tests {
         behavior.right.enabled = false;
 
         assert!(capture_edges(&topology, &node("local"), behavior).is_empty());
+    }
+
+    #[test]
+    fn emergency_shortcut_requires_control_alt_and_escape() {
+        let mut shortcut = EmergencyShortcut::default();
+
+        assert!(!shortcut.observe(key_event(0xe0, KeyAction::Press)));
+        assert!(!shortcut.observe(key_event(0xe2, KeyAction::Press)));
+        assert!(shortcut.observe(key_event(0x29, KeyAction::Press)));
+
+        assert!(!shortcut.observe(key_event(0xe2, KeyAction::Release)));
+        assert!(!shortcut.observe(key_event(0x29, KeyAction::Press)));
     }
 
     #[test]

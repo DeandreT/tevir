@@ -791,6 +791,23 @@ impl DesktopApp {
                         self.stop_session();
                         self.notice = Some(Notice::info("Session stopped"));
                     }
+                    if ui
+                        .add_enabled(
+                            self.session_state.is_controlling_remote(),
+                            Button::new("Return control").min_size(Vec2::new(112.0, 34.0)),
+                        )
+                        .clicked()
+                        && let Some(runtime) = self.session_runtime.as_ref()
+                    {
+                        match runtime.return_control() {
+                            Ok(()) => {
+                                self.notice = Some(Notice::info("Returning control"));
+                            }
+                            Err(error) => {
+                                self.notice = Some(Notice::error(error.to_string()));
+                            }
+                        }
+                    }
                 } else if ui
                     .add_enabled(
                         self.saved_config.is_some(),
