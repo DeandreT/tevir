@@ -137,7 +137,9 @@ protocol message. The controller retains subpixel pointer motion, supports
 negative global coordinates, and only crosses between rectangles that share an
 edge.
 
-Key and button transitions are never dropped. Pointer motion may be coalesced
-before serialization, but never across a key, button, or scroll boundary. Every
-queue and clipboard payload is bounded; overload produces an explicit
-backpressure condition instead of growing memory without a limit.
+The controller keeps one input batch in flight per agent and coalesces newer
+pointer motion until native application is acknowledged. Key and button
+transitions are never dropped, and pointer motion is never coalesced across a
+key, button, or scroll boundary. Every queue and clipboard payload is bounded;
+overload produces an explicit backpressure condition instead of growing memory
+without a limit.

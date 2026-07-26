@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::coalesce::EventBuffer;
 
 const MICROPIXELS_PER_PIXEL: i64 = 1_000_000;
-pub const MAX_PENDING_BATCHES_PER_PEER: usize = 64;
+pub const MAX_IN_FLIGHT_BATCHES_PER_PEER: usize = 1;
 
 pub struct ControllerSession {
     topology: Topology,
@@ -98,6 +98,12 @@ impl ControllerSession {
         let mut actions = Vec::new();
         if self.buffer.is_full() && !self.buffer.can_coalesce(event) {
             actions.extend(self.flush()?);
+            if self.buffer.is_full() {
+                return Err(ControllerError::Backpressure {
+                    peer: self.focus.clone(),
+                    buffered: protocol::MAX_INPUT_EVENTS_PER_BATCH,
+                });
+            }
         }
         self.observe_pointer(event)?;
         if self.buffer.push(event) {
@@ -119,16 +125,13 @@ impl ControllerSession {
             .deliveries
             .get_mut(&self.focus)
             .ok_or_else(|| ControllerError::UnknownPeer(self.focus.clone()))?;
-        if delivery.pending.len() >= MAX_PENDING_BATCHES_PER_PEER {
-            tracing::warn!(
+        if delivery.pending.len() >= MAX_IN_FLIGHT_BATCHES_PER_PEER {
+            tracing::trace!(
                 peer = %self.focus,
                 pending = delivery.pending.len(),
-                "input delivery backpressure"
+                "input delivery waiting for acknowledgement"
             );
-            return Err(ControllerError::Backpressure {
-                peer: self.focus.clone(),
-                maximum: MAX_PENDING_BATCHES_PER_PEER,
-            });
+            return Ok(Vec::new());
         }
         let sequence = delivery
             .last_sent
@@ -193,6 +196,7 @@ impl ControllerSession {
         if self.focus == self.local_node {
             return Ok(Vec::new());
         }
+        self.buffer.take();
         let local_screen = self
             .topology
             .screen(&self.local_node)
@@ -253,6 +257,9 @@ impl ControllerSession {
         recipients: Option<BTreeSet<NodeId>>,
     ) -> Result<Vec<ControllerAction>, ControllerError> {
         let mut actions = self.flush()?;
+        if !self.buffer.is_empty() {
+            return Ok(actions);
+        }
         let target_screen = self
             .topology
             .screen(&target)
@@ -437,8 +444,10 @@ pub enum ControllerError {
     NoAdjacentScreen { edge: Edge, offset: u32 },
     #[error("captured input arrived while focus was local")]
     InputWhileLocal,
-    #[error("peer `{peer}` has {maximum} unacknowledged batches")]
-    Backpressure { peer: NodeId, maximum: usize },
+    #[error(
+        "input buffer for peer `{peer}` contains {buffered} transitions while delivery is blocked"
+    )]
+    Backpressure { peer: NodeId, buffered: usize },
     #[error("input sequence for peer `{0}` is exhausted")]
     SequenceExhausted(NodeId),
     #[error("focus epoch is exhausted")]
@@ -463,9 +472,7 @@ mod tests {
     };
     use protocol::Session;
 
-    use super::{
-        ControllerAction, ControllerError, ControllerSession, MAX_PENDING_BATCHES_PER_PEER,
-    };
+    use super::{ControllerAction, ControllerError, ControllerSession};
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
@@ -713,43 +720,47 @@ mod tests {
     }
 
     #[test]
-    fn backpressure_retains_the_next_batch_until_an_acknowledgement() {
+    fn flow_control_coalesces_motion_until_an_acknowledgement() {
         let mut controller = ControllerSession::new(topology(), node("left"))
             .unwrap_or_else(|error| panic!("controller creation failed: {error}"));
         controller
             .activate(Edge::Right, 540)
             .unwrap_or_else(|error| panic!("activation failed: {error}"));
-        for sequence in 0..MAX_PENDING_BATCHES_PER_PEER {
-            controller
-                .route_input(relative(sequence as u64, 1, 0))
-                .and_then(|_| controller.flush())
-                .unwrap_or_else(|error| panic!("batch {sequence} failed: {error}"));
-        }
-
         controller
-            .route_input(relative(100, 1, 0))
-            .unwrap_or_else(|error| panic!("buffering should succeed: {error}"));
-        assert!(matches!(
-            controller.flush(),
-            Err(ControllerError::Backpressure { .. })
-        ));
+            .route_input(relative(1, 1, 0))
+            .and_then(|_| controller.flush())
+            .unwrap_or_else(|error| panic!("first batch failed: {error}"));
+        controller
+            .route_input(relative(2, 2, 0))
+            .and_then(|_| controller.route_input(relative(3, 3, 0)))
+            .unwrap_or_else(|error| panic!("motion buffering failed: {error}"));
+
+        assert!(controller.flush().is_ok_and(|actions| actions.is_empty()));
         assert_eq!(controller.acknowledge(&node("right"), 1), Ok(1));
-        assert!(controller.flush().is_ok_and(|actions| actions.len() == 1));
+        let actions = controller
+            .flush()
+            .unwrap_or_else(|error| panic!("coalesced batch failed: {error}"));
+        assert!(matches!(
+            actions.as_slice(),
+            [ControllerAction::Send {
+                message: Session::Input(batch),
+                ..
+            }] if batch.sequence == 2
+                && batch.events.as_slice() == [relative(3, 5, 0)]
+        ));
     }
 
     #[test]
-    fn backpressure_never_grows_a_batch_past_the_protocol_limit() {
+    fn blocked_delivery_never_grows_a_batch_past_the_protocol_limit() {
         let mut controller = ControllerSession::new(topology(), node("left"))
             .unwrap_or_else(|error| panic!("controller creation failed: {error}"));
         controller
             .activate(Edge::Right, 540)
             .unwrap_or_else(|error| panic!("activation failed: {error}"));
-        for sequence in 0..MAX_PENDING_BATCHES_PER_PEER {
-            controller
-                .route_input(relative(sequence as u64, 1, 0))
-                .and_then(|_| controller.flush())
-                .unwrap_or_else(|error| panic!("batch {sequence} failed: {error}"));
-        }
+        controller
+            .route_input(relative(1, 1, 0))
+            .and_then(|_| controller.flush())
+            .unwrap_or_else(|error| panic!("first batch failed: {error}"));
 
         for offset in 0..protocol::MAX_INPUT_EVENTS_PER_BATCH {
             let result = controller.route_input(InputEvent {
@@ -759,11 +770,7 @@ mod tests {
                     action: KeyAction::Press,
                 },
             });
-            if offset + 1 == protocol::MAX_INPUT_EVENTS_PER_BATCH {
-                assert!(matches!(result, Err(ControllerError::Backpressure { .. })));
-            } else {
-                assert!(result.is_ok());
-            }
+            assert!(result.is_ok());
         }
         assert!(matches!(
             controller.route_input(InputEvent {
