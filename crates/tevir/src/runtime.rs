@@ -17,12 +17,14 @@ use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 use transport::{
     PeerConnection, ReconnectPolicy, SecureClient, SecureServer, SessionLimits, SessionProfile,
+    TransportError,
 };
 
 use crate::config::{Config, Role};
 
 const COMMAND_CAPACITY: usize = 4;
 const EVENT_CAPACITY: usize = 256;
+const ACCEPT_CAPACITY: usize = 8;
 const NETWORK_EVENT_CAPACITY: usize = 256;
 const OUTBOUND_CAPACITY: usize = 128;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -232,6 +234,7 @@ async fn run_controller(
         .local_addr()
         .map_err(|error| RuntimeError::Transport(error.to_string()))?;
     send_event(&events, RuntimeEvent::Listening { address });
+    let (mut accepted, accept_worker) = spawn_accept_worker(server);
 
     let edges = capture_edges(&topology, &local_node);
     let capture =
@@ -260,8 +263,13 @@ async fn run_controller(
                     break;
                 }
             }
-            accepted = server.accept() => {
-                match accepted {
+            result = accepted.recv() => {
+                let Some(result) = result else {
+                    return Err(RuntimeError::Transport(String::from(
+                        "Secure connection listener stopped",
+                    )));
+                };
+                match result {
                     Ok(connection) => {
                         accept_controller_peer(
                             connection,
@@ -273,6 +281,7 @@ async fn run_controller(
                         )?;
                     }
                     Err(error) => {
+                        tracing::warn!(error = %error, "incoming secure connection rejected");
                         send_event(&events, RuntimeEvent::Error {
                             message: format!("Incoming connection rejected: {error}"),
                         });
@@ -318,8 +327,27 @@ async fn run_controller(
     for peer in peers.values() {
         let _ = peer.outbound.try_send(Session::Disconnect);
     }
+    accept_worker.abort();
     let _ = capture.release();
     Ok(())
+}
+
+fn spawn_accept_worker(
+    server: SecureServer,
+) -> (
+    tokio_mpsc::Receiver<Result<PeerConnection, TransportError>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (accepted_tx, accepted) = tokio_mpsc::channel(ACCEPT_CAPACITY);
+    let worker = tokio::spawn(async move {
+        loop {
+            let result = server.accept().await;
+            if accepted_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+    (accepted, worker)
 }
 
 fn accept_controller_peer(
@@ -973,11 +1001,18 @@ enum RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        num::NonZeroU32,
+        time::Duration,
+    };
 
     use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+    use identity::{IdentityStore, LocalIdentity, TrustStore};
+    use tempfile::TempDir;
+    use transport::{SecureClient, SecureServer, SessionLimits};
 
-    use super::{activation_target, capture_edges};
+    use super::{activation_target, capture_edges, session_profile, spawn_accept_worker};
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
@@ -996,6 +1031,24 @@ mod tests {
         }
     }
 
+    fn identity(directory: &TempDir, node_id: &str) -> LocalIdentity {
+        IdentityStore::new(directory.path())
+            .load_or_create(&node(node_id))
+            .unwrap_or_else(|error| panic!("identity creation failed: {error}"))
+    }
+
+    fn trust(directory: &TempDir, remote: &LocalIdentity) -> TrustStore {
+        let mut trust = IdentityStore::new(directory.path())
+            .trust_store()
+            .unwrap_or_else(|error| panic!("trust store creation failed: {error}"));
+        let bundle = remote.pairing_bundle();
+        let code = bundle.code().to_string();
+        trust
+            .trust(bundle, &code)
+            .unwrap_or_else(|error| panic!("pairing failed: {error}"));
+        trust
+    }
+
     #[test]
     fn capture_edges_and_offsets_follow_the_local_topology() {
         let topology = Topology::new(vec![
@@ -1009,5 +1062,51 @@ mod tests {
             activation_target(&topology, &node("local"), Edge::Right),
             Some((node("right"), 639))
         );
+    }
+
+    #[tokio::test]
+    async fn accept_worker_owns_the_handshake_until_completion() {
+        let controller_directory =
+            TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
+        let agent_directory =
+            TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
+        let controller = identity(&controller_directory, "controller");
+        let agent = identity(&agent_directory, "agent");
+        let controller_trust = trust(&controller_directory, &agent);
+        let agent_trust = trust(&agent_directory, &controller);
+        let server = SecureServer::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            controller,
+            &controller_trust,
+            session_profile(),
+            SessionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("server bind failed: {error}"));
+        let address = server
+            .local_addr()
+            .unwrap_or_else(|error| panic!("server address failed: {error}"));
+        let (mut accepted, worker) = spawn_accept_worker(server);
+        let client = SecureClient::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            agent,
+            &agent_trust,
+            session_profile(),
+            SessionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("client bind failed: {error}"));
+
+        let client_connection = client
+            .connect(&node("controller"), address)
+            .await
+            .unwrap_or_else(|error| panic!("client handshake failed: {error}"));
+        let server_connection = tokio::time::timeout(Duration::from_secs(1), accepted.recv())
+            .await
+            .unwrap_or_else(|_| panic!("accept worker timed out"))
+            .unwrap_or_else(|| panic!("accept worker stopped"))
+            .unwrap_or_else(|error| panic!("server handshake failed: {error}"));
+
+        assert_eq!(client_connection.info().peer, node("controller"));
+        assert_eq!(server_connection.info().peer, node("agent"));
+        worker.abort();
     }
 }
