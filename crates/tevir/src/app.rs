@@ -20,7 +20,7 @@ use protocol::Capabilities;
 use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
-    config::{Config, Role},
+    config::{Config, EdgeBehavior, Role},
     runtime::{NativeInputHost, RuntimeEvent, RuntimeRole, SessionRuntime},
     settings::{DesktopSettings, SettingsError},
 };
@@ -423,6 +423,21 @@ impl DesktopApp {
             self.notice = Some(Notice::error("Configuration path is required"));
             return;
         }
+        let can_apply_live = self.session_runtime.is_some()
+            && self.session_state.role == Some(RuntimeRole::Controller)
+            && self.saved_config.as_ref().is_some_and(|previous| {
+                previous.node == config.node
+                    && matches!(
+                        (&previous.role, &config.role),
+                        (
+                            Role::Controller {
+                                listen: previous_listen,
+                                ..
+                            },
+                            Role::Controller { listen, .. },
+                        ) if previous_listen == listen
+                    )
+            });
         match config.save(&path) {
             Ok(()) => {
                 self.config_summary = Some(config_summary(&config));
@@ -430,8 +445,24 @@ impl DesktopApp {
                 self.remember_config_path(&path);
                 self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration saved");
-                self.notice = Some(Notice::success("Configuration saved"));
-                self.start_session(config);
+                if can_apply_live
+                    && let (
+                        Some(runtime),
+                        Role::Controller {
+                            topology,
+                            edge_behavior,
+                            ..
+                        },
+                    ) = (self.session_runtime.as_ref(), &config.role)
+                    && runtime
+                        .reconfigure_controller(topology.clone(), *edge_behavior)
+                        .is_ok()
+                {
+                    self.notice = Some(Notice::success("Configuration saved and applying"));
+                } else {
+                    self.notice = Some(Notice::success("Configuration saved"));
+                    self.start_session(config);
+                }
             }
             Err(error) => {
                 tracing::error!(path = %path.display(), error = %error, "configuration save failed");
@@ -589,6 +620,9 @@ impl DesktopApp {
                         monitor_count,
                         if monitor_count == 1 { "" } else { "s" }
                     )));
+                }
+                RuntimeEvent::ConfigurationApplied => {
+                    self.notice = Some(Notice::success("Configuration applied"));
                 }
                 RuntimeEvent::Error { message } => {
                     self.notice = Some(Notice::error(message));
@@ -1245,6 +1279,62 @@ impl DesktopApp {
         if remove_selected {
             self.config_editor.remove_selected();
         }
+
+        ui.add_space(26.0);
+        section_heading(ui, "Edge switching", "Controller capture behavior");
+        ui.add_space(10.0);
+        ui.columns(2, |columns| {
+            columns[0].label(RichText::new("Switch delay").color(MUTED));
+            columns[0].add(
+                egui::Slider::new(
+                    &mut self.config_editor.edge_behavior.switch_delay_ms,
+                    0..=2_000,
+                )
+                .suffix(" ms"),
+            );
+            columns[1].label(RichText::new("Corner dead zone").color(MUTED));
+            columns[1].add(
+                egui::Slider::new(
+                    &mut self.config_editor.edge_behavior.corner_dead_zone_percent,
+                    0..=25,
+                )
+                .suffix("%"),
+            );
+        });
+        ui.add_space(8.0);
+        egui::Grid::new("edge-behavior-grid")
+            .num_columns(4)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Edge").color(MUTED));
+                ui.label(RichText::new("Enabled").color(MUTED));
+                ui.label(RichText::new("Active start").color(MUTED));
+                ui.label(RichText::new("Active end").color(MUTED));
+                ui.end_row();
+                for (edge, label) in [
+                    (domain::Edge::Left, "Left"),
+                    (domain::Edge::Right, "Right"),
+                    (domain::Edge::Top, "Top"),
+                    (domain::Edge::Bottom, "Bottom"),
+                ] {
+                    let rule = self.config_editor.edge_behavior.rule_mut(edge);
+                    ui.label(label);
+                    ui.checkbox(&mut rule.enabled, "");
+                    let maximum_start = rule.active_end_percent.saturating_sub(1);
+                    ui.add_enabled(
+                        rule.enabled,
+                        egui::Slider::new(&mut rule.active_start_percent, 0..=maximum_start)
+                            .suffix("%"),
+                    );
+                    let minimum_end = rule.active_start_percent.saturating_add(1);
+                    ui.add_enabled(
+                        rule.enabled,
+                        egui::Slider::new(&mut rule.active_end_percent, minimum_end..=100)
+                            .suffix("%"),
+                    );
+                    ui.end_row();
+                }
+            });
     }
 
     fn pairing_view(&mut self, ui: &mut Ui) {
@@ -1915,6 +2005,7 @@ impl SessionState {
                     },
                 );
             }
+            RuntimeEvent::ConfigurationApplied => {}
             RuntimeEvent::Error { message } => self.record_error(message),
             RuntimeEvent::Stopped => {
                 self.connected.clear();
@@ -1994,6 +2085,7 @@ struct ConfigEditor {
     agent_width: String,
     agent_height: String,
     agent_layout: DesktopLayout,
+    edge_behavior: EdgeBehavior,
     screens: Vec<ScreenEditor>,
     selected_screen: usize,
     canvas_view: Option<CanvasView>,
@@ -2013,6 +2105,7 @@ impl ConfigEditor {
                 NonZeroU32::new(1920).unwrap_or(NonZeroU32::MIN),
                 NonZeroU32::new(1080).unwrap_or(NonZeroU32::MIN),
             )),
+            edge_behavior: EdgeBehavior::default(),
             screens: vec![ScreenEditor::from_node(
                 node.map_or_else(|| String::from("local-node"), ToString::to_string),
                 0,
@@ -2026,7 +2119,11 @@ impl ConfigEditor {
 
     fn from_config(config: &Config) -> Self {
         match &config.role {
-            Role::Controller { listen, topology } => Self {
+            Role::Controller {
+                listen,
+                topology,
+                edge_behavior,
+            } => Self {
                 role: ConfigRole::Controller,
                 listen_address: listen.to_string(),
                 controller_node: String::from("peer-node"),
@@ -2037,6 +2134,7 @@ impl ConfigEditor {
                     NonZeroU32::new(1920).unwrap_or(NonZeroU32::MIN),
                     NonZeroU32::new(1080).unwrap_or(NonZeroU32::MIN),
                 )),
+                edge_behavior: *edge_behavior,
                 screens: topology
                     .screens()
                     .iter()
@@ -2058,6 +2156,7 @@ impl ConfigEditor {
                 agent_width: display_layout.size().width.to_string(),
                 agent_height: display_layout.size().height.to_string(),
                 agent_layout: display_layout.clone(),
+                edge_behavior: EdgeBehavior::default(),
                 screens: vec![ScreenEditor::from_local_node(&config.node)],
                 selected_screen: 0,
                 canvas_view: None,
@@ -2077,7 +2176,11 @@ impl ConfigEditor {
                     .map(|(index, screen)| screen.build(index))
                     .collect::<Result<Vec<_>, _>>()?;
                 let topology = Topology::new(screens).map_err(|error| error.to_string())?;
-                Role::Controller { listen, topology }
+                Role::Controller {
+                    listen,
+                    topology,
+                    edge_behavior: self.edge_behavior,
+                }
             }
             ConfigRole::Agent => {
                 let controller_node = NodeId::new(self.controller_node.trim())
@@ -2654,6 +2757,7 @@ fn topology_canvas(ui: &mut Ui, editor: &mut ConfigEditor, local_node: Option<&N
             geometry,
             editor.selected_screen == index,
             local,
+            editor.edge_behavior,
         );
     }
 }
@@ -2680,6 +2784,7 @@ fn paint_screen(
     geometry: ScreenGeometry,
     selected: bool,
     local: bool,
+    edge_behavior: EdgeBehavior,
 ) {
     let painter = painter.with_clip_rect(screen_rect);
     let stroke_color = if selected {
@@ -2722,6 +2827,9 @@ fn paint_screen(
         Stroke::new(if selected { 2.0 } else { 1.0 }, stroke_color),
         egui::StrokeKind::Inside,
     );
+    if local {
+        paint_active_edges(&painter, screen_rect, edge_behavior);
+    }
 
     let node_size = (screen_rect.width() / 16.0).clamp(8.0, 14.0);
     let detail_size = node_size.min(11.0);
@@ -2756,6 +2864,50 @@ fn paint_screen(
         FontId::monospace(detail_size),
         MUTED,
     );
+}
+
+fn paint_active_edges(
+    painter: &egui::Painter,
+    screen_rect: egui::Rect,
+    edge_behavior: EdgeBehavior,
+) {
+    for edge in [
+        domain::Edge::Left,
+        domain::Edge::Right,
+        domain::Edge::Top,
+        domain::Edge::Bottom,
+    ] {
+        let Some((start, end)) = edge_behavior.active_interval(edge) else {
+            continue;
+        };
+        let start = start as f32;
+        let end = end as f32;
+        let (first, second) = match edge {
+            domain::Edge::Left => (
+                egui::pos2(screen_rect.left(), egui::lerp(screen_rect.y_range(), start)),
+                egui::pos2(screen_rect.left(), egui::lerp(screen_rect.y_range(), end)),
+            ),
+            domain::Edge::Right => (
+                egui::pos2(
+                    screen_rect.right(),
+                    egui::lerp(screen_rect.y_range(), start),
+                ),
+                egui::pos2(screen_rect.right(), egui::lerp(screen_rect.y_range(), end)),
+            ),
+            domain::Edge::Top => (
+                egui::pos2(egui::lerp(screen_rect.x_range(), start), screen_rect.top()),
+                egui::pos2(egui::lerp(screen_rect.x_range(), end), screen_rect.top()),
+            ),
+            domain::Edge::Bottom => (
+                egui::pos2(
+                    egui::lerp(screen_rect.x_range(), start),
+                    screen_rect.bottom(),
+                ),
+                egui::pos2(egui::lerp(screen_rect.x_range(), end), screen_rect.bottom()),
+            ),
+        };
+        painter.line_segment([first, second], Stroke::new(3.0, ACCENT));
+    }
 }
 
 const fn rotation_label(rotation: DisplayRotation) -> &'static str {
@@ -2998,7 +3150,9 @@ fn parse_nonzero(label: &str, value: &str) -> Result<NonZeroU32, String> {
 
 fn config_summary(config: &Config) -> String {
     match &config.role {
-        Role::Controller { listen, topology } => format!(
+        Role::Controller {
+            listen, topology, ..
+        } => format!(
             "Controller {} | {listen} | {} screens",
             config.node,
             topology.screens().len()

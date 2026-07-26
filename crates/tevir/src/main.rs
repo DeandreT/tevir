@@ -145,7 +145,9 @@ fn check_config(path: &std::path::Path) -> Result<(), CliError> {
     tracing::info!(path = %path.display(), "validating configuration");
     let config = Config::load(path)?;
     match &config.role {
-        Role::Controller { listen, topology } => println!(
+        Role::Controller {
+            listen, topology, ..
+        } => println!(
             "valid controller configuration for `{}`: listening on {listen} with {} screen(s)",
             config.node,
             topology.screens().len()

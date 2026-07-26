@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use domain::{DesktopLayout, NodeId, Point, Rect, ScreenPlacement, Size, Topology, TopologyError};
+use domain::{
+    DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology, TopologyError,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -20,6 +22,7 @@ pub enum Role {
     Controller {
         listen: SocketAddr,
         topology: Topology,
+        edge_behavior: EdgeBehavior,
     },
     Agent {
         controller_node: NodeId,
@@ -30,10 +33,16 @@ pub enum Role {
 
 impl Config {
     pub fn new(node: NodeId, role: Role) -> Result<Self, ConfigError> {
-        if let Role::Controller { topology, .. } = &role
-            && topology.screen(&node).is_none()
+        if let Role::Controller {
+            topology,
+            edge_behavior,
+            ..
+        } = &role
         {
-            return Err(ConfigError::MissingLocalScreen(node));
+            if topology.screen(&node).is_none() {
+                return Err(ConfigError::MissingLocalScreen(node));
+            }
+            edge_behavior.validate()?;
         }
         if let Role::Agent {
             controller_node, ..
@@ -76,6 +85,122 @@ impl Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EdgeRule {
+    pub enabled: bool,
+    pub active_start_percent: u8,
+    pub active_end_percent: u8,
+}
+
+impl Default for EdgeRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            active_start_percent: 0,
+            active_end_percent: 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EdgeBehavior {
+    pub switch_delay_ms: u32,
+    pub corner_dead_zone_percent: u8,
+    pub left: EdgeRule,
+    pub right: EdgeRule,
+    pub top: EdgeRule,
+    pub bottom: EdgeRule,
+}
+
+impl EdgeBehavior {
+    const MAX_SWITCH_DELAY_MS: u32 = 5_000;
+    const MAX_CORNER_DEAD_ZONE_PERCENT: u8 = 49;
+
+    #[must_use]
+    pub const fn rule(&self, edge: Edge) -> EdgeRule {
+        match edge {
+            Edge::Left => self.left,
+            Edge::Right => self.right,
+            Edge::Top => self.top,
+            Edge::Bottom => self.bottom,
+        }
+    }
+
+    pub fn rule_mut(&mut self, edge: Edge) -> &mut EdgeRule {
+        match edge {
+            Edge::Left => &mut self.left,
+            Edge::Right => &mut self.right,
+            Edge::Top => &mut self.top,
+            Edge::Bottom => &mut self.bottom,
+        }
+    }
+
+    #[must_use]
+    pub fn active_interval(&self, edge: Edge) -> Option<(f64, f64)> {
+        let rule = self.rule(edge);
+        if !rule.enabled {
+            return None;
+        }
+        let start = rule.active_start_percent.max(self.corner_dead_zone_percent);
+        let end = rule
+            .active_end_percent
+            .min(100u8.saturating_sub(self.corner_dead_zone_percent));
+        (start < end).then(|| (f64::from(start) / 100.0, f64::from(end) / 100.0))
+    }
+
+    #[must_use]
+    pub fn allows(&self, edge: Edge, position: f64) -> bool {
+        self.active_interval(edge)
+            .is_some_and(|(start, end)| position >= start && position <= end)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.switch_delay_ms > Self::MAX_SWITCH_DELAY_MS {
+            return Err(ConfigError::InvalidEdgeBehavior(format!(
+                "switch delay must not exceed {} ms",
+                Self::MAX_SWITCH_DELAY_MS
+            )));
+        }
+        if self.corner_dead_zone_percent > Self::MAX_CORNER_DEAD_ZONE_PERCENT {
+            return Err(ConfigError::InvalidEdgeBehavior(format!(
+                "corner dead zone must not exceed {}%",
+                Self::MAX_CORNER_DEAD_ZONE_PERCENT
+            )));
+        }
+        for (name, rule) in [
+            ("left", self.left),
+            ("right", self.right),
+            ("top", self.top),
+            ("bottom", self.bottom),
+        ] {
+            if rule.active_start_percent > 100
+                || rule.active_end_percent > 100
+                || rule.active_start_percent >= rule.active_end_percent
+            {
+                return Err(ConfigError::InvalidEdgeBehavior(format!(
+                    "{name} edge active range must increase between 0% and 100%"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for EdgeBehavior {
+    fn default() -> Self {
+        Self {
+            switch_delay_ms: 0,
+            corner_dead_zone_percent: 2,
+            left: EdgeRule::default(),
+            right: EdgeRule::default(),
+            top: EdgeRule::default(),
+            bottom: EdgeRule::default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -86,11 +211,16 @@ struct ConfigFile {
 impl ConfigFile {
     fn validate(self) -> Result<Config, ConfigError> {
         let role = match self.role {
-            RoleFile::Controller { listen, screens } => {
+            RoleFile::Controller {
+                listen,
+                screens,
+                edge_behavior,
+            } => {
                 let placements = screens.into_iter().map(Screen::into_placement).collect();
                 Role::Controller {
                     listen,
                     topology: Topology::new(placements)?,
+                    edge_behavior,
                 }
             }
             RoleFile::Agent {
@@ -112,13 +242,18 @@ impl ConfigFile {
 impl From<&Config> for ConfigFile {
     fn from(config: &Config) -> Self {
         let role = match &config.role {
-            Role::Controller { listen, topology } => RoleFile::Controller {
+            Role::Controller {
+                listen,
+                topology,
+                edge_behavior,
+            } => RoleFile::Controller {
                 listen: *listen,
                 screens: topology
                     .screens()
                     .iter()
                     .map(Screen::from_placement)
                     .collect(),
+                edge_behavior: *edge_behavior,
             },
             Role::Agent {
                 controller_node,
@@ -152,6 +287,8 @@ enum RoleFile {
     Controller {
         listen: SocketAddr,
         screens: Vec<Screen>,
+        #[serde(default)]
+        edge_behavior: EdgeBehavior,
     },
     Agent {
         controller_node: NodeId,
@@ -226,13 +363,33 @@ pub enum ConfigError {
     MissingLocalScreen(NodeId),
     #[error("agent node `{0}` cannot use itself as its controller")]
     LocalController(NodeId),
+    #[error("edge behavior is invalid: {0}")]
+    InvalidEdgeBehavior(String),
 }
 
 #[cfg(test)]
 mod tests {
+    use domain::Edge;
     use tempfile::TempDir;
 
-    use super::{Config, ConfigError, Role};
+    use super::{Config, ConfigError, EdgeBehavior, Role};
+
+    #[test]
+    fn edge_behavior_applies_ranges_and_corner_dead_zones() {
+        let mut behavior = EdgeBehavior {
+            corner_dead_zone_percent: 10,
+            ..EdgeBehavior::default()
+        };
+        behavior.right.active_start_percent = 5;
+        behavior.right.active_end_percent = 80;
+
+        assert!(!behavior.allows(Edge::Right, 0.09));
+        assert!(behavior.allows(Edge::Right, 0.10));
+        assert!(behavior.allows(Edge::Right, 0.80));
+        assert!(!behavior.allows(Edge::Right, 0.81));
+        behavior.right.enabled = false;
+        assert!(!behavior.allows(Edge::Right, 0.5));
+    }
 
     #[test]
     fn parses_a_controller_topology() {
@@ -290,6 +447,32 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ConfigError::MissingLocalScreen(_))));
+    }
+
+    #[test]
+    fn rejects_invalid_edge_behavior() {
+        let result = Config::parse(
+            r#"
+                [node]
+                id = "left"
+
+                [role]
+                kind = "controller"
+                listen = "127.0.0.1:24800"
+
+                [role.edge_behavior]
+                corner_dead_zone_percent = 50
+
+                [[role.screens]]
+                node = "left"
+                x = 0
+                y = 0
+                width = 1920
+                height = 1080
+            "#,
+        );
+
+        assert!(matches!(result, Err(ConfigError::InvalidEdgeBehavior(_))));
     }
 
     #[test]

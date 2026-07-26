@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Topology};
@@ -21,7 +21,7 @@ use transport::{
     SessionLimits, SessionProfile, TransportError,
 };
 
-use crate::config::{Config, Role};
+use crate::config::{Config, EdgeBehavior, Role};
 
 const COMMAND_CAPACITY: usize = 4;
 const EVENT_CAPACITY: usize = 256;
@@ -65,6 +65,19 @@ impl SessionRuntime {
 
     pub fn try_recv(&self) -> Result<RuntimeEvent, TryRecvError> {
         self.events.try_recv()
+    }
+
+    pub fn reconfigure_controller(
+        &self,
+        topology: Topology,
+        edge_behavior: EdgeBehavior,
+    ) -> Result<(), RuntimeCommandError> {
+        self.commands
+            .try_send(RuntimeCommand::ReconfigureController {
+                topology,
+                edge_behavior,
+            })
+            .map_err(|_| RuntimeCommandError)
     }
 
     pub fn stop(mut self) {
@@ -168,6 +181,7 @@ pub enum RuntimeEvent {
     DisplayChanged {
         screen: ScreenPlacement,
     },
+    ConfigurationApplied,
     Error {
         message: String,
     },
@@ -176,7 +190,15 @@ pub enum RuntimeEvent {
 
 enum RuntimeCommand {
     Stop,
+    ReconfigureController {
+        topology: Topology,
+        edge_behavior: EdgeBehavior,
+    },
 }
+
+#[derive(Clone, Copy, Debug, Error)]
+#[error("session command queue is unavailable")]
+pub struct RuntimeCommandError;
 
 fn validate_trust(config: &Config, trust: &TrustStore) -> Result<(), RuntimeStartError> {
     match &config.role {
@@ -231,11 +253,19 @@ fn run_worker(
         }
     };
     let result = match (config.role.clone(), native_input) {
-        (Role::Controller { listen, topology }, NativeInputHost::Controller(capture)) => {
+        (
+            Role::Controller {
+                listen,
+                topology,
+                edge_behavior,
+            },
+            NativeInputHost::Controller(capture),
+        ) => {
             let result = runtime.block_on(run_controller(
                 config.node,
                 listen,
                 topology,
+                edge_behavior,
                 identity,
                 trust,
                 capture.clone(),
@@ -286,6 +316,7 @@ async fn run_controller(
     local_node: NodeId,
     listen: SocketAddr,
     mut topology: Topology,
+    edge_behavior: EdgeBehavior,
     identity: LocalIdentity,
     trust: TrustStore,
     capture: CaptureService,
@@ -307,7 +338,7 @@ async fn run_controller(
     send_event(&events, RuntimeEvent::Listening { address });
     let (mut accepted, accept_worker) = spawn_accept_worker(server);
 
-    let edges = capture_edges(&topology, &local_node);
+    let edges = capture_edges(&topology, &local_node, edge_behavior);
     capture
         .configure(&edges)
         .map_err(|error| RuntimeError::Native(error.to_string()))?;
@@ -335,12 +366,54 @@ async fn run_controller(
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_nonce = 0u64;
+    let mut edge_state = EdgeState {
+        behavior: edge_behavior,
+        pending_activation: None,
+    };
 
     loop {
         tokio::select! {
             command = commands.recv() => {
-                if command.is_none() || matches!(command, Some(RuntimeCommand::Stop)) {
-                    break;
+                match command {
+                    None | Some(RuntimeCommand::Stop) => break,
+                    Some(RuntimeCommand::ReconfigureController {
+                        topology: updated,
+                        edge_behavior: updated_behavior,
+                    }) => {
+                        edge_state.pending_activation = None;
+                        let actions = controller
+                            .reconcile_topology(updated.clone())
+                            .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                        apply_controller_actions(actions, &capture, &peers, &events)?;
+                        topology = updated;
+                        edge_state.behavior = updated_behavior;
+                        let removed = peers
+                            .keys()
+                            .filter(|peer| topology.screen(peer).is_none())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for peer in removed {
+                            if let Some(connection) = peers.remove(&peer) {
+                                let _ = connection.outbound.try_send(Session::Disconnect);
+                            }
+                            send_event(&events, RuntimeEvent::Disconnected {
+                                peer,
+                                reason: String::from("Removed from the topology"),
+                            });
+                        }
+                        capture
+                            .configure(&capture_edges(
+                                &topology,
+                                &local_node,
+                                edge_state.behavior,
+                            ))
+                            .map_err(|error| RuntimeError::Native(error.to_string()))?;
+                        send_event(&events, RuntimeEvent::FocusChanged {
+                            node: controller.focus().clone(),
+                        });
+                        send_event(&events, RuntimeEvent::ConfigurationApplied);
+                        tracing::info!("controller topology and edge behavior applied live");
+                    }
                 }
             }
             result = accepted.recv() => {
@@ -387,6 +460,14 @@ async fn run_controller(
                     &local_node,
                     &mut controller,
                     &peers,
+                    &mut edge_state,
+                    &events,
+                )?;
+                complete_pending_activation(
+                    &capture,
+                    &mut controller,
+                    &peers,
+                    &mut edge_state.pending_activation,
                     &events,
                 )?;
                 let actions = controller
@@ -481,6 +562,7 @@ fn drain_capture_events(
     local_node: &NodeId,
     controller: &mut ControllerSession,
     peers: &BTreeMap<NodeId, ActivePeer>,
+    edge_state: &mut EdgeState,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
     while let Ok(event) = capture.try_recv() {
@@ -492,6 +574,13 @@ fn drain_capture_events(
                 edge,
                 edge_position,
             } => {
+                let position = edge_position.unwrap_or(0.5).clamp(0.0, 1.0);
+                if !edge_state.behavior.allows(edge, position) {
+                    capture
+                        .release()
+                        .map_err(|error| RuntimeError::Native(error.to_string()))?;
+                    continue;
+                }
                 let Some((target, offset)) =
                     activation_target(topology, local_node, edge, edge_position)
                 else {
@@ -512,18 +601,24 @@ fn drain_capture_events(
                     );
                     continue;
                 }
-                let actions = controller
-                    .activate(edge, offset)
-                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
-                apply_controller_actions(actions, capture, peers, events)?;
-                send_event(
-                    events,
-                    RuntimeEvent::FocusChanged {
-                        node: controller.focus().clone(),
-                    },
-                );
+                if edge_state.behavior.switch_delay_ms == 0 {
+                    activate_controller(edge, offset, controller, capture, peers, events)?;
+                } else {
+                    edge_state.pending_activation = Some(PendingActivation {
+                        edge,
+                        offset,
+                        target,
+                        ready_at: Instant::now()
+                            + Duration::from_millis(u64::from(edge_state.behavior.switch_delay_ms)),
+                    });
+                }
             }
             CaptureServiceEvent::DesktopChanged(geometry) => {
+                if edge_state.pending_activation.take().is_some() {
+                    capture
+                        .release()
+                        .map_err(|error| RuntimeError::Native(error.to_string()))?;
+                }
                 let updated = resize_topology_screen(topology, local_node, &geometry.layout)
                     .map_err(RuntimeError::Session)?;
                 if updated != *topology {
@@ -542,6 +637,9 @@ fn drain_capture_events(
                 send_event(events, RuntimeEvent::LocalDesktopChanged { geometry });
             }
             CaptureServiceEvent::Input(event) => {
+                if edge_state.pending_activation.is_some() {
+                    continue;
+                }
                 if controller.focus() == local_node {
                     continue;
                 }
@@ -559,7 +657,9 @@ fn drain_capture_events(
                     );
                 }
             }
-            CaptureServiceEvent::Released => {}
+            CaptureServiceEvent::Released => {
+                edge_state.pending_activation = None;
+            }
             CaptureServiceEvent::Failed { operation, reason } => {
                 return Err(RuntimeError::Native(format!("{operation}: {reason}")));
             }
@@ -570,6 +670,59 @@ fn drain_capture_events(
             }
         }
     }
+    Ok(())
+}
+
+fn complete_pending_activation(
+    capture: &CaptureService,
+    controller: &mut ControllerSession,
+    peers: &BTreeMap<NodeId, ActivePeer>,
+    pending: &mut Option<PendingActivation>,
+    events: &SyncSender<RuntimeEvent>,
+) -> Result<(), RuntimeError> {
+    if pending
+        .as_ref()
+        .is_none_or(|pending| pending.ready_at > Instant::now())
+    {
+        return Ok(());
+    }
+    let Some(pending) = pending.take() else {
+        return Ok(());
+    };
+    if !peers.contains_key(&pending.target) {
+        capture
+            .release()
+            .map_err(|error| RuntimeError::Native(error.to_string()))?;
+        return Ok(());
+    }
+    activate_controller(
+        pending.edge,
+        pending.offset,
+        controller,
+        capture,
+        peers,
+        events,
+    )
+}
+
+fn activate_controller(
+    edge: Edge,
+    offset: u32,
+    controller: &mut ControllerSession,
+    capture: &CaptureService,
+    peers: &BTreeMap<NodeId, ActivePeer>,
+    events: &SyncSender<RuntimeEvent>,
+) -> Result<(), RuntimeError> {
+    let actions = controller
+        .activate(edge, offset)
+        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+    apply_controller_actions(actions, capture, peers, events)?;
+    send_event(
+        events,
+        RuntimeEvent::FocusChanged {
+            node: controller.focus().clone(),
+        },
+    );
     Ok(())
 }
 
@@ -1194,10 +1347,17 @@ fn spawn_control_reader(
     (events, worker)
 }
 
-fn capture_edges(topology: &Topology, local_node: &NodeId) -> Vec<Edge> {
+fn capture_edges(
+    topology: &Topology,
+    local_node: &NodeId,
+    edge_behavior: EdgeBehavior,
+) -> Vec<Edge> {
     [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
         .into_iter()
-        .filter(|edge| activation_target(topology, local_node, *edge, None).is_some())
+        .filter(|edge| {
+            edge_behavior.active_interval(*edge).is_some()
+                && activation_target(topology, local_node, *edge, None).is_some()
+        })
         .collect()
 }
 
@@ -1289,39 +1449,56 @@ fn shared_edge_offset(
     candidate: &ScreenPlacement,
     edge: Edge,
 ) -> Option<u32> {
-    let (touches, source_start, overlap_start, overlap_end) = match edge {
-        Edge::Left | Edge::Right => {
-            let touches = match edge {
-                Edge::Left => candidate.bounds.right() == source.bounds.left(),
-                Edge::Right => candidate.bounds.left() == source.bounds.right(),
-                Edge::Top | Edge::Bottom => false,
-            };
-            (
-                touches,
-                source.bounds.top(),
-                source.bounds.top().max(candidate.bounds.top()),
-                source.bounds.bottom().min(candidate.bounds.bottom()),
-            )
-        }
-        Edge::Top | Edge::Bottom => {
-            let touches = match edge {
-                Edge::Top => candidate.bounds.bottom() == source.bounds.top(),
-                Edge::Bottom => candidate.bounds.top() == source.bounds.bottom(),
-                Edge::Left | Edge::Right => false,
-            };
-            (
-                touches,
-                source.bounds.left(),
-                source.bounds.left().max(candidate.bounds.left()),
-                source.bounds.right().min(candidate.bounds.right()),
-            )
-        }
+    let (touches, opposite, source_start, candidate_start) = match edge {
+        Edge::Left => (
+            candidate.bounds.right() == source.bounds.left(),
+            Edge::Right,
+            source.bounds.top(),
+            candidate.bounds.top(),
+        ),
+        Edge::Right => (
+            candidate.bounds.left() == source.bounds.right(),
+            Edge::Left,
+            source.bounds.top(),
+            candidate.bounds.top(),
+        ),
+        Edge::Top => (
+            candidate.bounds.bottom() == source.bounds.top(),
+            Edge::Bottom,
+            source.bounds.left(),
+            candidate.bounds.left(),
+        ),
+        Edge::Bottom => (
+            candidate.bounds.top() == source.bounds.bottom(),
+            Edge::Top,
+            source.bounds.left(),
+            candidate.bounds.left(),
+        ),
     };
-    if !touches || overlap_start >= overlap_end {
+    if !touches {
         return None;
     }
-    let midpoint = overlap_start + (overlap_end - overlap_start - 1) / 2;
-    u32::try_from(midpoint - source_start).ok()
+    source.layout.edge_segments(edge).into_iter().find_map(
+        |(source_segment_start, source_segment_end)| {
+            let source_segment_start = source_start + i64::from(source_segment_start);
+            let source_segment_end = source_start + i64::from(source_segment_end);
+            candidate
+                .layout
+                .edge_segments(opposite)
+                .into_iter()
+                .find_map(|(candidate_segment_start, candidate_segment_end)| {
+                    let overlap_start = source_segment_start
+                        .max(candidate_start + i64::from(candidate_segment_start));
+                    let overlap_end =
+                        source_segment_end.min(candidate_start + i64::from(candidate_segment_end));
+                    if overlap_start >= overlap_end {
+                        return None;
+                    }
+                    let midpoint = overlap_start + (overlap_end - overlap_start - 1) / 2;
+                    u32::try_from(midpoint - source_start).ok()
+                })
+        },
+    )
 }
 
 fn session_profile() -> SessionProfile {
@@ -1343,6 +1520,18 @@ fn send_event(events: &SyncSender<RuntimeEvent>, event: RuntimeEvent) {
 struct ActivePeer {
     session_id: u128,
     outbound: tokio_mpsc::Sender<Session>,
+}
+
+struct PendingActivation {
+    edge: Edge,
+    offset: u32,
+    target: NodeId,
+    ready_at: Instant,
+}
+
+struct EdgeState {
+    behavior: EdgeBehavior,
+    pending_activation: Option<PendingActivation>,
 }
 
 enum ControlReadEvent {
@@ -1465,7 +1654,14 @@ mod tests {
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
-        assert_eq!(capture_edges(&topology, &node("local")), vec![Edge::Right]);
+        assert_eq!(
+            capture_edges(
+                &topology,
+                &node("local"),
+                crate::config::EdgeBehavior::default()
+            ),
+            vec![Edge::Right]
+        );
         assert_eq!(
             activation_target(&topology, &node("local"), Edge::Right, None),
             Some((node("right"), 539))
@@ -1484,11 +1680,31 @@ mod tests {
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
-        assert_eq!(capture_edges(&topology, &node("local")), vec![Edge::Right]);
+        assert_eq!(
+            capture_edges(
+                &topology,
+                &node("local"),
+                crate::config::EdgeBehavior::default()
+            ),
+            vec![Edge::Right]
+        );
         assert_eq!(
             activation_target(&topology, &node("local"), Edge::Right, None),
             Some((node("right"), 89))
         );
+    }
+
+    #[test]
+    fn disabled_edges_do_not_install_capture_barriers() {
+        let topology = Topology::new(vec![
+            screen("local", 0, 0, 1920, 1080),
+            screen("right", 1920, 0, 1920, 1080),
+        ])
+        .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
+        let mut behavior = crate::config::EdgeBehavior::default();
+        behavior.right.enabled = false;
+
+        assert!(capture_edges(&topology, &node("local"), behavior).is_empty());
     }
 
     #[test]
