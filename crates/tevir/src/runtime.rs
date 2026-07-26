@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use domain::{Edge, NodeId, ScreenPlacement, Size, Topology};
+use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
     BackendKind, CaptureService, CaptureServiceEvent, DesktopGeometry, InjectionService,
@@ -1222,17 +1222,47 @@ fn resize_topology_screen(
     let current = topology
         .screen(node)
         .ok_or_else(|| format!("node `{node}` is not present in the topology"))?;
-    if current.size == size {
+    if current.bounds.size == size {
         return Ok(topology.clone());
     }
 
+    let old_width = i64::from(current.bounds.size.width.get());
+    let old_height = i64::from(current.bounds.size.height.get());
+    let new_width = i64::from(size.width.get());
+    let new_height = i64::from(size.height.get());
+    let mut x = current.bounds.left() + (old_width - new_width) / 2;
+    let mut y = current.bounds.top() + (old_height - new_height) / 2;
+
+    for neighbor in topology
+        .screens()
+        .iter()
+        .filter(|screen| &screen.node != node)
+    {
+        if current.bounds.left() == neighbor.bounds.right() {
+            x = current.bounds.left();
+        } else if current.bounds.right() == neighbor.bounds.left() {
+            x = neighbor.bounds.left() - new_width;
+        }
+        if current.bounds.top() == neighbor.bounds.bottom() {
+            y = current.bounds.top();
+        } else if current.bounds.bottom() == neighbor.bounds.top() {
+            y = neighbor.bounds.top() - new_height;
+        }
+    }
+
+    let origin = Point {
+        x: i32::try_from(x)
+            .map_err(|_| format!("resized desktop for `{node}` exceeds the coordinate range"))?,
+        y: i32::try_from(y)
+            .map_err(|_| format!("resized desktop for `{node}` exceeds the coordinate range"))?,
+    };
     let screens = topology
         .screens()
         .iter()
         .cloned()
         .map(|mut screen| {
             if &screen.node == node {
-                screen.size = size;
+                screen.bounds = Rect::new(origin, size);
             }
             screen
         })
@@ -1249,21 +1279,60 @@ fn activation_target(
     let source = topology.screen(local_node)?;
     if let Some(edge_position) = edge_position {
         let length = match edge {
-            Edge::Left | Edge::Right => source.size.height.get(),
-            Edge::Top | Edge::Bottom => source.size.width.get(),
+            Edge::Left | Edge::Right => source.bounds.size.height.get(),
+            Edge::Top | Edge::Bottom => source.bounds.size.width.get(),
         };
         let maximum = length.saturating_sub(1);
         let offset = (edge_position.clamp(0.0, 1.0) * f64::from(maximum)).round() as u32;
         let transition = topology.transition(local_node, edge, offset)?;
         return Some((transition.target.clone(), offset));
     }
-    let length = match edge {
-        Edge::Left | Edge::Right => source.size.height.get(),
-        Edge::Top | Edge::Bottom => source.size.width.get(),
+    topology.screens().iter().find_map(|candidate| {
+        if candidate.node == source.node {
+            return None;
+        }
+        shared_edge_offset(source, candidate, edge).map(|offset| (candidate.node.clone(), offset))
+    })
+}
+
+fn shared_edge_offset(
+    source: &ScreenPlacement,
+    candidate: &ScreenPlacement,
+    edge: Edge,
+) -> Option<u32> {
+    let (touches, source_start, overlap_start, overlap_end) = match edge {
+        Edge::Left | Edge::Right => {
+            let touches = match edge {
+                Edge::Left => candidate.bounds.right() == source.bounds.left(),
+                Edge::Right => candidate.bounds.left() == source.bounds.right(),
+                Edge::Top | Edge::Bottom => false,
+            };
+            (
+                touches,
+                source.bounds.top(),
+                source.bounds.top().max(candidate.bounds.top()),
+                source.bounds.bottom().min(candidate.bounds.bottom()),
+            )
+        }
+        Edge::Top | Edge::Bottom => {
+            let touches = match edge {
+                Edge::Top => candidate.bounds.bottom() == source.bounds.top(),
+                Edge::Bottom => candidate.bounds.top() == source.bounds.bottom(),
+                Edge::Left | Edge::Right => false,
+            };
+            (
+                touches,
+                source.bounds.left(),
+                source.bounds.left().max(candidate.bounds.left()),
+                source.bounds.right().min(candidate.bounds.right()),
+            )
+        }
     };
-    let offset = length.saturating_sub(1) / 2;
-    let transition = topology.transition(local_node, edge, offset)?;
-    Some((transition.target.clone(), offset))
+    if !touches || overlap_start >= overlap_end {
+        return None;
+    }
+    let midpoint = overlap_start + (overlap_end - overlap_start - 1) / 2;
+    u32::try_from(midpoint - source_start).ok()
 }
 
 fn session_profile() -> SessionProfile {
@@ -1352,7 +1421,7 @@ mod tests {
         time::Duration,
     };
 
-    use domain::{Edge, GridSlot, NodeId, ScreenPlacement, Size, Topology};
+    use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
     use identity::{IdentityStore, LocalIdentity, TrustStore};
     use protocol::Session;
     use tempfile::TempDir;
@@ -1368,13 +1437,15 @@ mod tests {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
     }
 
-    fn screen(node_id: &str, column: u8, row: u8, width: u32, height: u32) -> ScreenPlacement {
+    fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
         ScreenPlacement {
             node: node(node_id),
-            slot: GridSlot::new(column, row),
-            size: Size::new(
-                NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
-                NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+            bounds: Rect::new(
+                Point { x, y },
+                Size::new(
+                    NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+                    NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+                ),
             ),
         }
     }
@@ -1400,8 +1471,8 @@ mod tests {
     #[test]
     fn capture_edges_and_offsets_follow_the_local_topology() {
         let topology = Topology::new(vec![
-            screen("local", 2, 2, 1920, 1080),
-            screen("right", 3, 2, 2560, 1440),
+            screen("local", 0, 180, 1920, 1080),
+            screen("right", 1920, 0, 2560, 1440),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
@@ -1417,10 +1488,25 @@ mod tests {
     }
 
     #[test]
+    fn capture_edges_include_partial_overlap_away_from_the_midpoint() {
+        let topology = Topology::new(vec![
+            screen("local", 0, 0, 1920, 1080),
+            screen("right", 1920, -900, 2560, 1080),
+        ])
+        .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
+
+        assert_eq!(capture_edges(&topology, &node("local")), vec![Edge::Right]);
+        assert_eq!(
+            activation_target(&topology, &node("local"), Edge::Right, None),
+            Some((node("right"), 89))
+        );
+    }
+
+    #[test]
     fn reported_display_size_preserves_a_right_hand_attachment() {
         let topology = Topology::new(vec![
-            screen("local", 2, 2, 1920, 1080),
-            screen("right", 3, 2, 1920, 1080),
+            screen("local", 0, 0, 1920, 1080),
+            screen("right", 1920, 0, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
@@ -1436,15 +1522,15 @@ mod tests {
 
         assert_eq!(
             updated.screen(&node("right")),
-            Some(&screen("right", 3, 2, 2560, 1440))
+            Some(&screen("right", 1920, -180, 2560, 1440))
         );
     }
 
     #[test]
     fn reported_display_size_preserves_a_left_hand_attachment() {
         let topology = Topology::new(vec![
-            screen("left", 1, 2, 1920, 1080),
-            screen("local", 2, 2, 1920, 1080),
+            screen("left", 0, 0, 1920, 1080),
+            screen("local", 1920, 0, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
@@ -1460,7 +1546,7 @@ mod tests {
 
         assert_eq!(
             updated.screen(&node("left")),
-            Some(&screen("left", 1, 2, 2560, 1440))
+            Some(&screen("left", -640, -180, 2560, 1440))
         );
     }
 

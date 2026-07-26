@@ -231,7 +231,7 @@ impl ControllerSession {
             let screen = topology
                 .screen(&self.focus)
                 .ok_or_else(|| ControllerError::UnknownPeer(self.focus.clone()))?;
-            self.clamp_focus_position(screen.size);
+            self.clamp_focus_position(screen.bounds.size);
         }
 
         self.topology = topology;
@@ -314,8 +314,10 @@ impl ControllerSession {
             .ok_or_else(|| ControllerError::UnknownPeer(self.focus.clone()))?;
         let destination_x = self.focus_x_micropixels.saturating_add(dx_micropixels);
         let destination_y = self.focus_y_micropixels.saturating_add(dy_micropixels);
-        let width = i64::from(current.size.width.get()).saturating_mul(MICROPIXELS_PER_PIXEL);
-        let height = i64::from(current.size.height.get()).saturating_mul(MICROPIXELS_PER_PIXEL);
+        let width =
+            i64::from(current.bounds.size.width.get()).saturating_mul(MICROPIXELS_PER_PIXEL);
+        let height =
+            i64::from(current.bounds.size.height.get()).saturating_mul(MICROPIXELS_PER_PIXEL);
         if destination_x >= 0
             && destination_x < width
             && destination_y >= 0
@@ -367,10 +369,10 @@ impl ControllerSession {
                 target_y = target_y.saturating_add(destination_y.saturating_sub(height));
             }
         }
-        let maximum_x = i64::from(destination.size.width.get())
+        let maximum_x = i64::from(destination.bounds.size.width.get())
             .saturating_mul(MICROPIXELS_PER_PIXEL)
             .saturating_sub(1);
-        let maximum_y = i64::from(destination.size.height.get())
+        let maximum_y = i64::from(destination.bounds.size.height.get())
             .saturating_mul(MICROPIXELS_PER_PIXEL)
             .saturating_sub(1);
         Ok(Some((
@@ -397,7 +399,7 @@ impl ControllerSession {
             .topology
             .screen(&self.focus)
             .ok_or_else(|| ControllerError::UnknownPeer(self.focus.clone()))?;
-        self.clamp_focus_position(screen.size);
+        self.clamp_focus_position(screen.bounds.size);
         Ok(())
     }
 
@@ -444,14 +446,14 @@ fn peer_nodes<'a>(
 
 fn screen_center(screen: &ScreenPlacement) -> Point {
     Point {
-        x: i32::try_from(screen.size.width.get() / 2).unwrap_or(i32::MAX),
-        y: i32::try_from(screen.size.height.get() / 2).unwrap_or(i32::MAX),
+        x: i32::try_from(screen.bounds.size.width.get() / 2).unwrap_or(i32::MAX),
+        y: i32::try_from(screen.bounds.size.height.get() / 2).unwrap_or(i32::MAX),
     }
 }
 
 fn clamp_local_position(screen: &ScreenPlacement, position: Point) -> Point {
-    let maximum_x = i32::try_from(screen.size.width.get() - 1).unwrap_or(i32::MAX);
-    let maximum_y = i32::try_from(screen.size.height.get() - 1).unwrap_or(i32::MAX);
+    let maximum_x = i32::try_from(screen.bounds.size.width.get() - 1).unwrap_or(i32::MAX);
+    let maximum_y = i32::try_from(screen.bounds.size.height.get() - 1).unwrap_or(i32::MAX);
     Point {
         x: position.x.clamp(0, maximum_x),
         y: position.y.clamp(0, maximum_y),
@@ -500,8 +502,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use domain::{
-        Edge, GridSlot, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point,
-        ScreenPlacement, Size, Topology,
+        Edge, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point, Rect, ScreenPlacement,
+        Size, Topology,
     };
     use protocol::Session;
 
@@ -511,21 +513,23 @@ mod tests {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
     }
 
-    fn screen(node_id: &str, column: u8, row: u8, width: u32, height: u32) -> ScreenPlacement {
+    fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
         ScreenPlacement {
             node: node(node_id),
-            slot: GridSlot::new(column, row),
-            size: Size::new(
-                NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
-                NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+            bounds: Rect::new(
+                Point { x, y },
+                Size::new(
+                    NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+                    NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+                ),
             ),
         }
     }
 
     fn topology() -> Topology {
         Topology::new(vec![
-            screen("left", 1, 2, 1920, 1080),
-            screen("right", 2, 2, 2560, 1440),
+            screen("left", 0, 180, 1920, 1080),
+            screen("right", 1920, 0, 2560, 1440),
         ])
         .unwrap_or_else(|error| panic!("test topology should be valid: {error}"))
     }
@@ -659,8 +663,8 @@ mod tests {
             .route_input(relative(1, 10, 10))
             .unwrap_or_else(|error| panic!("routing failed: {error}"));
         let changed = Topology::new(vec![
-            screen("left", 1, 2, 1600, 900),
-            screen("right", 2, 2, 1920, 1080),
+            screen("left", 0, 90, 1600, 900),
+            screen("right", 1600, 0, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("changed topology should be valid: {error}"));
 

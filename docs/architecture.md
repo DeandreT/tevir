@@ -110,9 +110,10 @@ system and adopts their aggregate physical-pixel desktop bounds, falling back
 to its configured dimensions. After authentication, an agent reports the
 effective size and monitor count before accepting focus or input. Native
 display changes invalidate active focus, release held input, and produce
-another report. The controller reconciles that size with the configured grid
-slot, publishes the live placement to the desktop UI, and sends the resulting
-focus state to the agent.
+another report. The controller keeps the reported desktop attached to its
+configured neighbor while preserving its center on the other axis, publishes
+the live placement to the desktop UI, and sends the resulting focus state to
+the agent.
 
 ## Clipboard
 
@@ -141,13 +142,14 @@ reinjection; gaps and stale epochs are rejected. Focus changes, display changes,
 and broken connections release held state before another epoch can inject
 input.
 
-Topology uses a fixed 5x5 grid of machines. Each occupied slot represents one
-node's aggregate desktop, regardless of its local monitor arrangement. Focus
-can cross only into an occupied neighboring slot. An edge transition normalizes
-the activation position along the source edge, maps it proportionally onto the
-destination edge, and sends the destination-local absolute entry position
-before relative motion resumes. The controller retains subpixel pointer motion
-inside each desktop.
+Topology positions each node's aggregate desktop in a shared physical-pixel
+coordinate space, regardless of its local monitor arrangement. The visual
+editor scales that unbounded space to its canvas and snaps dragged desktops to
+non-overlapping shared edges. Focus can cross only along the portion of an edge
+that physically touches another desktop. The shared coordinate becomes the
+destination-local absolute entry position before relative motion resumes, so
+different resolutions and vertical or horizontal offsets are preserved. The
+controller retains subpixel pointer motion inside each desktop.
 
 The controller keeps one input batch in flight per agent and coalesces newer
 pointer motion until native application is acknowledged. Key and button
