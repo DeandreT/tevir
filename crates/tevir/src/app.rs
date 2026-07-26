@@ -544,6 +544,39 @@ impl DesktopApp {
         }
     }
 
+    fn test_connection(&mut self) {
+        let Some(runtime) = self.session_runtime.as_ref() else {
+            return;
+        };
+        match runtime.test_connection() {
+            Ok(()) => {
+                self.session_state.begin_connection_test();
+                self.notice = Some(Notice::info("Connection test started"));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn expire_connection_tests(&mut self) {
+        let timed_out = self.session_state.expire_connection_tests();
+        if !timed_out.is_empty() {
+            tracing::warn!(
+                peers = %timed_out.iter().map(NodeId::as_str).collect::<Vec<_>>().join(","),
+                "connection test timed out"
+            );
+            self.notice = Some(Notice::error(format!(
+                "Connection test timed out for {}",
+                timed_out
+                    .iter()
+                    .map(NodeId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+
     fn initialize_desktop_integration(&mut self) {
         match DesktopIntegration::start() {
             Ok(integration) => {
@@ -732,6 +765,15 @@ impl DesktopApp {
                         format!("Clipboard sent to {peer}")
                     }));
                 }
+                RuntimeEvent::ConnectionDiagnostics {
+                    peer,
+                    test_completed: true,
+                    ..
+                } => {
+                    self.notice = Some(Notice::success(format!(
+                        "Connection test with {peer} passed"
+                    )));
+                }
                 RuntimeEvent::Error { message } => {
                     self.notice = Some(Notice::error(message));
                 }
@@ -742,6 +784,7 @@ impl DesktopApp {
                 | RuntimeEvent::NativeReady { .. }
                 | RuntimeEvent::FocusChanged { .. }
                 | RuntimeEvent::AgentControl { .. }
+                | RuntimeEvent::ConnectionDiagnostics { .. }
                 | RuntimeEvent::Stopped => {}
             }
             stopped |= matches!(event, RuntimeEvent::Stopped);
@@ -1683,6 +1726,106 @@ impl DesktopApp {
 
     fn diagnostics_view(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            section_heading(ui, "Live connection", "Heartbeat and input delivery");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        self.session_runtime.is_some() && !self.session_state.connected.is_empty(),
+                        Button::new("Test connection"),
+                    )
+                    .clicked()
+                {
+                    self.test_connection();
+                }
+            });
+        });
+        ui.add_space(12.0);
+        if self.session_state.diagnostics.is_empty() {
+            empty_state(ui, "No active connections");
+        }
+        for (peer, diagnostics) in &self.session_state.diagnostics {
+            let (test_label, test_color) = if diagnostics.test_started.is_some() {
+                ("Testing", WARNING)
+            } else {
+                match diagnostics.last_test_passed {
+                    Some(true) => ("Test passed", SUCCESS),
+                    Some(false) => ("Test timed out", DANGER),
+                    None => ("Connected", SUCCESS),
+                }
+            };
+            Frame::new()
+                .fill(ELEVATED)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(peer.as_str()).strong().color(TEXT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            status_label(ui, test_label, test_color);
+                            if diagnostics.test_started.is_some() {
+                                ui.spinner();
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    let latency = diagnostics
+                        .round_trip_micros
+                        .map_or_else(|| String::from("Not measured"), format_latency);
+                    let latency_color = diagnostics.round_trip_micros.map_or(MUTED, |micros| {
+                        if micros <= 50_000 {
+                            SUCCESS
+                        } else if micros <= 150_000 {
+                            WARNING
+                        } else {
+                            DANGER
+                        }
+                    });
+                    metric_row(ui, "Round trip", &latency, latency_color);
+                    metric_row(
+                        ui,
+                        "Connected for",
+                        &format_session_age(diagnostics.connected_at.elapsed()),
+                        TEXT,
+                    );
+                    metric_row(
+                        ui,
+                        "Reconnects",
+                        &diagnostics.reconnects.to_string(),
+                        if diagnostics.reconnects == 0 {
+                            SUCCESS
+                        } else {
+                            WARNING
+                        },
+                    );
+                    let delivery = match self.session_state.role {
+                        Some(RuntimeRole::Agent) => format!(
+                            "{} applied / {} received",
+                            diagnostics.input_batches_acknowledged,
+                            diagnostics.input_batches_received
+                        ),
+                        Some(RuntimeRole::Controller) | None => format!(
+                            "{} acknowledged / {} sent",
+                            diagnostics.input_batches_acknowledged, diagnostics.input_batches_sent
+                        ),
+                    };
+                    metric_row(ui, "Input batches", &delivery, TEXT);
+                    metric_row(
+                        ui,
+                        "Pending input",
+                        &diagnostics.pending_input_batches.to_string(),
+                        if diagnostics.pending_input_batches == 0 {
+                            SUCCESS
+                        } else {
+                            WARNING
+                        },
+                    );
+                });
+            ui.add_space(8.0);
+        }
+
+        ui.add_space(24.0);
+        ui.horizontal(|ui| {
             section_heading(ui, "Desktop environment", "Native input prerequisites");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Refresh").clicked() {
@@ -1788,6 +1931,7 @@ impl eframe::App for DesktopApp {
         self.start_deferred_session();
         self.poll_discovery();
         self.poll_session();
+        self.expire_connection_tests();
         self.poll_native_input();
         self.poll_desktop_integration(ui.ctx());
         if self.identity.is_none() {
@@ -2029,6 +2173,26 @@ fn format_elapsed(elapsed_millis: u128) -> String {
     format!("+{minutes:02}:{seconds:02}.{millis:03}")
 }
 
+fn format_latency(micros: u64) -> String {
+    if micros < 1_000 {
+        format!("{micros} us")
+    } else {
+        format!("{:.1} ms", micros as f64 / 1_000.0)
+    }
+}
+
+fn format_session_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds / 60) % 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else {
+        format!("{minutes}m {seconds:02}s")
+    }
+}
+
 fn component_target(target: &str) -> &str {
     target.split("::").next().unwrap_or(target)
 }
@@ -2105,6 +2269,8 @@ struct SessionState {
     phase: SessionPhase,
     role: Option<RuntimeRole>,
     connected: BTreeMap<NodeId, u128>,
+    connection_counts: BTreeMap<NodeId, u32>,
+    diagnostics: BTreeMap<NodeId, PeerDiagnostics>,
     displays: BTreeMap<NodeId, RemoteDisplay>,
     focus: Option<NodeId>,
     agent_controlled: bool,
@@ -2119,6 +2285,34 @@ struct RemoteDisplay {
     monitor_count: u32,
 }
 
+struct PeerDiagnostics {
+    connected_at: Instant,
+    reconnects: u32,
+    round_trip_micros: Option<u64>,
+    input_batches_sent: u64,
+    input_batches_received: u64,
+    input_batches_acknowledged: u64,
+    pending_input_batches: usize,
+    test_started: Option<Instant>,
+    last_test_passed: Option<bool>,
+}
+
+impl PeerDiagnostics {
+    fn connected(reconnects: u32) -> Self {
+        Self {
+            connected_at: Instant::now(),
+            reconnects,
+            round_trip_micros: None,
+            input_batches_sent: 0,
+            input_batches_received: 0,
+            input_batches_acknowledged: 0,
+            pending_input_batches: 0,
+            test_started: None,
+            last_test_passed: None,
+        }
+    }
+}
+
 impl SessionState {
     fn apply(&mut self, event: RuntimeEvent) {
         match event {
@@ -2126,6 +2320,8 @@ impl SessionState {
                 self.phase = SessionPhase::Starting;
                 self.role = Some(role);
                 self.connected.clear();
+                self.connection_counts.clear();
+                self.diagnostics.clear();
                 self.displays.clear();
                 self.focus = None;
                 self.agent_controlled = false;
@@ -2146,12 +2342,19 @@ impl SessionState {
                 self.phase = SessionPhase::Connecting;
             }
             RuntimeEvent::Connected { peer, session_id } => {
-                self.connected.insert(peer, session_id);
+                self.connected.insert(peer.clone(), session_id);
+                let connections = self.connection_counts.entry(peer.clone()).or_default();
+                *connections = connections.saturating_add(1);
+                self.diagnostics.insert(
+                    peer,
+                    PeerDiagnostics::connected(connections.saturating_sub(1)),
+                );
                 self.phase = SessionPhase::Connected;
                 self.last_error = None;
             }
             RuntimeEvent::Disconnected { peer, reason } => {
                 self.connected.remove(&peer);
+                self.diagnostics.remove(&peer);
                 self.displays.remove(&peer);
                 self.agent_controlled = false;
                 self.last_error = Some(format!("{peer}: {reason}"));
@@ -2171,6 +2374,29 @@ impl SessionState {
             }
             RuntimeEvent::ClipboardSynchronized { peer, received } => {
                 tracing::info!(%peer, received, "clipboard synchronized");
+            }
+            RuntimeEvent::ConnectionDiagnostics {
+                peer,
+                round_trip_micros,
+                input_batches_sent,
+                input_batches_received,
+                input_batches_acknowledged,
+                pending_input_batches,
+                test_completed,
+            } => {
+                let diagnostics = self
+                    .diagnostics
+                    .entry(peer)
+                    .or_insert_with(|| PeerDiagnostics::connected(0));
+                diagnostics.round_trip_micros = round_trip_micros;
+                diagnostics.input_batches_sent = input_batches_sent;
+                diagnostics.input_batches_received = input_batches_received;
+                diagnostics.input_batches_acknowledged = input_batches_acknowledged;
+                diagnostics.pending_input_batches = pending_input_batches;
+                if test_completed {
+                    diagnostics.test_started = None;
+                    diagnostics.last_test_passed = Some(true);
+                }
             }
             RuntimeEvent::FocusChanged { node } => {
                 self.focus = Some(node);
@@ -2195,6 +2421,8 @@ impl SessionState {
             RuntimeEvent::Error { message } => self.record_error(message),
             RuntimeEvent::Stopped => {
                 self.connected.clear();
+                self.connection_counts.clear();
+                self.diagnostics.clear();
                 self.displays.clear();
                 self.agent_controlled = false;
                 self.native_ready = false;
@@ -2246,6 +2474,31 @@ impl SessionState {
 
     fn is_ready(&self) -> bool {
         self.native_ready && !self.connected.is_empty()
+    }
+
+    fn begin_connection_test(&mut self) {
+        let now = Instant::now();
+        for diagnostics in self.diagnostics.values_mut() {
+            diagnostics.test_started = Some(now);
+            diagnostics.last_test_passed = None;
+        }
+    }
+
+    fn expire_connection_tests(&mut self) -> Vec<NodeId> {
+        const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        let mut timed_out = Vec::new();
+        for (peer, diagnostics) in &mut self.diagnostics {
+            if diagnostics
+                .test_started
+                .is_some_and(|started| now.duration_since(started) >= TEST_TIMEOUT)
+            {
+                diagnostics.test_started = None;
+                diagnostics.last_test_passed = Some(false);
+                timed_out.push(peer.clone());
+            }
+        }
+        timed_out
     }
 }
 
@@ -3405,7 +3658,10 @@ pub enum AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{
+        num::NonZeroU32,
+        time::{Duration, Instant},
+    };
 
     use domain::{DesktopLayout, Monitor, NodeId, Point, Rect, ScreenPlacement, Size};
     use identity::IdentityStore;
@@ -3746,5 +4002,58 @@ mod tests {
         assert!(state.is_ready());
         assert!(state.is_controlling_remote());
         assert_eq!(state.status().0, "Connected");
+    }
+
+    #[test]
+    fn connection_diagnostics_track_tests_and_timeouts() {
+        let remote = NodeId::new("studio-right")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let mut state = SessionState::default();
+        state.apply(RuntimeEvent::Starting {
+            role: RuntimeRole::Controller,
+        });
+        state.apply(RuntimeEvent::Connected {
+            peer: remote.clone(),
+            session_id: 42,
+        });
+
+        state.begin_connection_test();
+        assert!(
+            state
+                .diagnostics
+                .get(&remote)
+                .is_some_and(|diagnostics| diagnostics.test_started.is_some())
+        );
+        state.apply(RuntimeEvent::ConnectionDiagnostics {
+            peer: remote.clone(),
+            round_trip_micros: Some(1_250),
+            input_batches_sent: 7,
+            input_batches_received: 0,
+            input_batches_acknowledged: 6,
+            pending_input_batches: 1,
+            test_completed: true,
+        });
+        let diagnostics = state
+            .diagnostics
+            .get(&remote)
+            .unwrap_or_else(|| panic!("peer diagnostics should exist"));
+        assert_eq!(diagnostics.round_trip_micros, Some(1_250));
+        assert_eq!(diagnostics.last_test_passed, Some(true));
+        assert!(diagnostics.test_started.is_none());
+
+        state.begin_connection_test();
+        state
+            .diagnostics
+            .get_mut(&remote)
+            .unwrap_or_else(|| panic!("peer diagnostics should exist"))
+            .test_started = Some(Instant::now() - Duration::from_secs(6));
+        assert_eq!(state.expire_connection_tests(), vec![remote.clone()]);
+        assert_eq!(
+            state
+                .diagnostics
+                .get(&remote)
+                .and_then(|diagnostics| diagnostics.last_test_passed),
+            Some(false)
+        );
     }
 }

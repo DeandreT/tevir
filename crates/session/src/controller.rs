@@ -250,6 +250,15 @@ impl ControllerSession {
             .map_or(0, |delivery| delivery.pending.len())
     }
 
+    #[must_use]
+    pub fn delivery_progress(&self, peer: &NodeId) -> Option<DeliveryProgress> {
+        self.deliveries.get(peer).map(|delivery| DeliveryProgress {
+            sent: delivery.last_sent,
+            acknowledged: delivery.last_acknowledged,
+            pending: delivery.pending.len(),
+        })
+    }
+
     fn change_focus(
         &mut self,
         target: NodeId,
@@ -424,6 +433,13 @@ impl ControllerSession {
 pub enum ControllerAction {
     Send { peer: NodeId, message: Session },
     ReleaseCapture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryProgress {
+    pub sent: u64,
+    pub acknowledged: u64,
+    pub pending: usize,
 }
 
 #[derive(Debug, Default)]

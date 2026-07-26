@@ -6,5 +6,6 @@ mod controller;
 pub use agent::{AgentAction, AgentError, AgentSession};
 pub use clipboard::{ClipboardAction, ClipboardSession, ClipboardSessionError};
 pub use controller::{
-    ControllerAction, ControllerError, ControllerSession, MAX_IN_FLIGHT_BATCHES_PER_PEER,
+    ControllerAction, ControllerError, ControllerSession, DeliveryProgress,
+    MAX_IN_FLIGHT_BATCHES_PER_PEER,
 };

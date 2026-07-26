@@ -40,6 +40,7 @@ const OUTBOUND_CAPACITY: usize = 128;
 const CLIPBOARD_OUTBOUND_CAPACITY: usize = 8;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_PENDING_HEARTBEATS: usize = 4;
 
 pub struct SessionRuntime {
     commands: tokio_mpsc::Sender<RuntimeCommand>,
@@ -93,6 +94,12 @@ impl SessionRuntime {
     pub fn return_control(&self) -> Result<(), RuntimeCommandError> {
         self.commands
             .try_send(RuntimeCommand::ReturnLocal)
+            .map_err(|_| RuntimeCommandError)
+    }
+
+    pub fn test_connection(&self) -> Result<(), RuntimeCommandError> {
+        self.commands
+            .try_send(RuntimeCommand::TestConnection)
             .map_err(|_| RuntimeCommandError)
     }
 
@@ -212,6 +219,15 @@ pub enum RuntimeEvent {
         peer: NodeId,
         received: bool,
     },
+    ConnectionDiagnostics {
+        peer: NodeId,
+        round_trip_micros: Option<u64>,
+        input_batches_sent: u64,
+        input_batches_received: u64,
+        input_batches_acknowledged: u64,
+        pending_input_batches: usize,
+        test_completed: bool,
+    },
     ConfigurationApplied,
     Error {
         message: String,
@@ -222,6 +238,7 @@ pub enum RuntimeEvent {
 enum RuntimeCommand {
     Stop,
     ReturnLocal,
+    TestConnection,
     ReconfigureController {
         topology: Topology,
         edge_behavior: EdgeBehavior,
@@ -439,6 +456,13 @@ async fn run_controller(
                         });
                         tracing::info!("control returned to the controller");
                     }
+                    Some(RuntimeCommand::TestConnection) => {
+                        send_controller_heartbeats(
+                            &mut peers,
+                            &mut heartbeat_nonce,
+                            true,
+                        );
+                    }
                     Some(RuntimeCommand::ReconfigureController {
                         topology: updated,
                         edge_behavior: updated_behavior,
@@ -542,12 +566,7 @@ async fn run_controller(
                 drain_controller_clipboard(&local_node, &mut peers, &mut clipboard_state, &events)?;
             }
             _ = heartbeat_tick.tick() => {
-                heartbeat_nonce = heartbeat_nonce.wrapping_add(1);
-                for peer in peers.values() {
-                    let _ = peer.outbound.try_send(Session::Heartbeat {
-                        nonce: heartbeat_nonce,
-                    });
-                }
+                send_controller_heartbeats(&mut peers, &mut heartbeat_nonce, false);
             }
         }
     }
@@ -558,6 +577,33 @@ async fn run_controller(
     accept_worker.abort();
     let _ = capture.release();
     Ok(())
+}
+
+fn send_controller_heartbeats(
+    peers: &mut BTreeMap<NodeId, ActivePeer>,
+    next_nonce: &mut u64,
+    test: bool,
+) {
+    *next_nonce = next_nonce.wrapping_add(1);
+    let nonce = *next_nonce;
+    let sent_at = Instant::now();
+    for (peer_node, peer) in peers {
+        if peer.outbound.try_send(Session::Heartbeat { nonce }).is_ok() {
+            if peer.pending_heartbeats.len() == MAX_PENDING_HEARTBEATS {
+                peer.pending_heartbeats.pop_front();
+            }
+            peer.pending_heartbeats.push_back(PendingHeartbeat {
+                nonce,
+                sent_at,
+                test,
+            });
+            if test {
+                tracing::info!(peer = %peer_node, nonce, "connection test started");
+            }
+        } else if test {
+            tracing::warn!(peer = %peer_node, "connection test could not enter the outbound queue");
+        }
+    }
 }
 
 fn spawn_accept_worker(
@@ -623,6 +669,8 @@ fn accept_controller_peer(
             session_id: info.session_id,
             outbound,
             clipboard,
+            pending_heartbeats: VecDeque::new(),
+            round_trip: None,
         },
     );
     tracing::info!(peer = %info.peer, session_id = info.session_id, "controller peer connected");
@@ -1075,6 +1123,7 @@ fn handle_controller_network(
                 controller
                     .acknowledge(&peer, through_sequence)
                     .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                emit_controller_diagnostics(&peer, controller, peers, events, false);
             }
             Session::Heartbeat { nonce } => {
                 if let Some(connection) = peers.get(&peer) {
@@ -1083,7 +1132,30 @@ fn handle_controller_network(
                         .try_send(Session::HeartbeatAcknowledged { nonce });
                 }
             }
-            Session::HeartbeatAcknowledged { .. } => {}
+            Session::HeartbeatAcknowledged { nonce } => {
+                let measurement = peers.get_mut(&peer).and_then(|active| {
+                    let position = active
+                        .pending_heartbeats
+                        .iter()
+                        .position(|pending| pending.nonce == nonce)?;
+                    let pending = active.pending_heartbeats.remove(position)?;
+                    let round_trip = pending.sent_at.elapsed();
+                    active.round_trip = Some(round_trip);
+                    Some((round_trip, pending.test))
+                });
+                if let Some((round_trip, test)) = measurement {
+                    if test {
+                        tracing::info!(
+                            %peer,
+                            round_trip_micros = duration_micros(round_trip),
+                            "connection test completed"
+                        );
+                    }
+                    emit_controller_diagnostics(&peer, controller, peers, events, test);
+                } else {
+                    tracing::debug!(%peer, nonce, "ignored an unknown heartbeat acknowledgement");
+                }
+            }
             Session::Clipboard(control) => {
                 let acknowledged = matches!(&control, protocol::ClipboardControl::Applied { .. });
                 let actions = peers
@@ -1177,6 +1249,37 @@ fn handle_controller_network(
         NetworkEvent::ClipboardTransfer { .. } | NetworkEvent::ClipboardFailed { .. } => {}
     }
     Ok(())
+}
+
+fn emit_controller_diagnostics(
+    peer: &NodeId,
+    controller: &ControllerSession,
+    peers: &BTreeMap<NodeId, ActivePeer>,
+    events: &SyncSender<RuntimeEvent>,
+    test_completed: bool,
+) {
+    let Some(active) = peers.get(peer) else {
+        return;
+    };
+    let Some(progress) = controller.delivery_progress(peer) else {
+        return;
+    };
+    send_event(
+        events,
+        RuntimeEvent::ConnectionDiagnostics {
+            peer: peer.clone(),
+            round_trip_micros: active.round_trip.map(duration_micros),
+            input_batches_sent: progress.sent,
+            input_batches_received: 0,
+            input_batches_acknowledged: progress.acknowledged,
+            pending_input_batches: progress.pending,
+            test_completed,
+        },
+    );
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1404,6 +1507,11 @@ async fn run_agent_connection(
     input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut controlled = false;
     let mut application_pending = false;
+    let mut heartbeat_nonce = 0_u64;
+    let mut pending_heartbeats = VecDeque::new();
+    let mut round_trip = None;
+    let mut input_batches_received = 0_u64;
+    let mut input_batches_acknowledged = 0_u64;
 
     let outcome = async {
         sender
@@ -1427,10 +1535,34 @@ async fn run_agent_connection(
         'session: loop {
             tokio::select! {
             command = commands.recv() => {
-                if command.is_none() || matches!(command, Some(RuntimeCommand::Stop)) {
-                    let _ = sender.send(Session::Disconnect).await;
-                    let _ = injection.release_all(injection_generation);
-                    break Ok(AgentConnectionOutcome::Stopped);
+                match command {
+                    None | Some(RuntimeCommand::Stop) => {
+                        let _ = sender.send(Session::Disconnect).await;
+                        let _ = injection.release_all(injection_generation);
+                        break Ok(AgentConnectionOutcome::Stopped);
+                    }
+                    Some(RuntimeCommand::TestConnection) => {
+                        heartbeat_nonce = heartbeat_nonce.wrapping_add(1);
+                        sender
+                            .send(Session::Heartbeat { nonce: heartbeat_nonce })
+                            .await
+                            .map_err(|error| RuntimeError::Transport(error.to_string()))?;
+                        if pending_heartbeats.len() == MAX_PENDING_HEARTBEATS {
+                            pending_heartbeats.pop_front();
+                        }
+                        pending_heartbeats.push_back(PendingHeartbeat {
+                            nonce: heartbeat_nonce,
+                            sent_at: Instant::now(),
+                            test: true,
+                        });
+                        tracing::info!(
+                            peer = %controller_node,
+                            nonce = heartbeat_nonce,
+                            "connection test started"
+                        );
+                    }
+                    Some(RuntimeCommand::ReturnLocal)
+                    | Some(RuntimeCommand::ReconfigureController { .. }) => {}
                 }
             }
             inbound_event = inbound.recv(), if !application_pending => {
@@ -1472,6 +1604,33 @@ async fn run_agent_connection(
                         });
                     }
                     continue 'session;
+                }
+                if let Session::HeartbeatAcknowledged { nonce } = message {
+                    let measurement = pending_heartbeats
+                        .iter()
+                        .position(|pending| pending.nonce == nonce)
+                        .and_then(|position| pending_heartbeats.remove(position));
+                    if let Some(pending) = measurement {
+                        let measured = pending.sent_at.elapsed();
+                        round_trip = Some(measured);
+                        tracing::info!(
+                            peer = %controller_node,
+                            round_trip_micros = duration_micros(measured),
+                            "connection test completed"
+                        );
+                        emit_agent_diagnostics(
+                            controller_node,
+                            round_trip,
+                            input_batches_received,
+                            input_batches_acknowledged,
+                            pending.test,
+                            events,
+                        );
+                    }
+                    continue 'session;
+                }
+                if matches!(&message, Session::Input(_)) {
+                    input_batches_received = input_batches_received.saturating_add(1);
                 }
                 let actions = agent
                     .handle(message)
@@ -1613,6 +1772,16 @@ async fn run_agent_connection(
                                     &mut sender,
                                 )
                                 .await?;
+                                input_batches_acknowledged =
+                                    input_batches_acknowledged.saturating_add(1);
+                                emit_agent_diagnostics(
+                                    controller_node,
+                                    round_trip,
+                                    input_batches_received,
+                                    input_batches_acknowledged,
+                                    false,
+                                    events,
+                                );
                             } else {
                                 tracing::debug!(
                                     generation,
@@ -1650,6 +1819,28 @@ async fn run_agent_connection(
     sender.close();
     reader_worker.abort();
     outcome
+}
+
+fn emit_agent_diagnostics(
+    controller: &NodeId,
+    round_trip: Option<Duration>,
+    input_batches_received: u64,
+    input_batches_acknowledged: u64,
+    test_completed: bool,
+    events: &SyncSender<RuntimeEvent>,
+) {
+    send_event(
+        events,
+        RuntimeEvent::ConnectionDiagnostics {
+            peer: controller.clone(),
+            round_trip_micros: round_trip.map(duration_micros),
+            input_batches_sent: 0,
+            input_batches_received,
+            input_batches_acknowledged,
+            pending_input_batches: usize::from(input_batches_received > input_batches_acknowledged),
+            test_completed,
+        },
+    );
 }
 
 async fn apply_agent_actions(
@@ -2116,6 +2307,14 @@ struct ActivePeer {
     session_id: u128,
     outbound: tokio_mpsc::Sender<Session>,
     clipboard: Option<ActiveClipboard>,
+    pending_heartbeats: VecDeque<PendingHeartbeat>,
+    round_trip: Option<Duration>,
+}
+
+struct PendingHeartbeat {
+    nonce: u64,
+    sent_at: Instant,
+    test: bool,
 }
 
 struct ActiveClipboard {
