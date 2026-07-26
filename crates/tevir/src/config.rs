@@ -103,7 +103,7 @@ impl Default for EdgeRule {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EdgeBehavior {
     pub switch_delay_ms: u32,
@@ -185,19 +185,6 @@ impl EdgeBehavior {
             }
         }
         Ok(())
-    }
-}
-
-impl Default for EdgeBehavior {
-    fn default() -> Self {
-        Self {
-            switch_delay_ms: 0,
-            corner_dead_zone_percent: 2,
-            left: EdgeRule::default(),
-            right: EdgeRule::default(),
-            top: EdgeRule::default(),
-            bottom: EdgeRule::default(),
-        }
     }
 }
 

@@ -575,7 +575,13 @@ fn drain_capture_events(
                 edge_position,
             } => {
                 let position = edge_position.unwrap_or(0.5).clamp(0.0, 1.0);
+                tracing::info!(?edge, position, "controller capture edge activated");
                 if !edge_state.behavior.allows(edge, position) {
+                    tracing::info!(
+                        ?edge,
+                        position,
+                        "capture released because the edge policy excludes this position"
+                    );
                     capture
                         .release()
                         .map_err(|error| RuntimeError::Native(error.to_string()))?;
@@ -584,12 +590,23 @@ fn drain_capture_events(
                 let Some((target, offset)) =
                     activation_target(topology, local_node, edge, edge_position)
                 else {
+                    tracing::info!(
+                        ?edge,
+                        position,
+                        "capture released because no desktop is reachable here"
+                    );
                     capture
                         .release()
                         .map_err(|error| RuntimeError::Native(error.to_string()))?;
                     continue;
                 };
                 if !peers.contains_key(&target) {
+                    tracing::info!(
+                        ?edge,
+                        position,
+                        %target,
+                        "capture released because the target is disconnected"
+                    );
                     capture
                         .release()
                         .map_err(|error| RuntimeError::Native(error.to_string()))?;
@@ -602,6 +619,7 @@ fn drain_capture_events(
                     continue;
                 }
                 if edge_state.behavior.switch_delay_ms == 0 {
+                    tracing::info!(?edge, offset, %target, "transferring control to peer");
                     activate_controller(edge, offset, controller, capture, peers, events)?;
                 } else {
                     edge_state.pending_activation = Some(PendingActivation {
