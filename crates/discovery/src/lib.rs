@@ -35,9 +35,10 @@ impl DiscoveryService {
         bundle: PairingBundle,
         platform: HostPlatform,
         capabilities: Capabilities,
+        session_port: u16,
     ) -> Result<Self, DiscoveryError> {
         let local_node = bundle.node().clone();
-        let service = advertisement(&bundle, platform, capabilities, "")?;
+        let service = advertisement(&bundle, platform, capabilities, "", session_port)?;
         let fullname = service.get_fullname().to_owned();
         let daemon = ServiceDaemon::new().map_err(DiscoveryError::daemon)?;
         let monitor = daemon.monitor().map_err(DiscoveryError::daemon)?;
@@ -162,6 +163,7 @@ pub struct DiscoveredNode {
     platform: HostPlatform,
     capabilities: Capabilities,
     addresses: BTreeSet<IpAddr>,
+    session_port: u16,
     pairing_bundle: PairingBundle,
 }
 
@@ -221,6 +223,7 @@ impl DiscoveredNode {
             platform,
             capabilities,
             addresses,
+            session_port: service.get_port(),
             pairing_bundle,
         })
     }
@@ -243,6 +246,11 @@ impl DiscoveredNode {
     #[must_use]
     pub fn addresses(&self) -> &BTreeSet<IpAddr> {
         &self.addresses
+    }
+
+    #[must_use]
+    pub const fn session_port(&self) -> u16 {
+        self.session_port
     }
 
     #[must_use]
@@ -274,6 +282,11 @@ impl NearbyNodes {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &DiscoveredNode> {
         self.entries.values()
+    }
+
+    #[must_use]
+    pub fn get(&self, node: &NodeId) -> Option<&DiscoveredNode> {
+        self.entries.get(node)
     }
 
     fn upsert(&mut self, node: DiscoveredNode) -> RegistryUpdate {
@@ -326,6 +339,7 @@ fn advertisement(
     platform: HostPlatform,
     capabilities: Capabilities,
     addresses: impl mdns_sd::AsIpAddrs,
+    session_port: u16,
 ) -> Result<ServiceInfo, DiscoveryError> {
     let encoded_bundle = bundle.encode();
     let chunks = encoded_bundle
@@ -370,7 +384,7 @@ fn advertisement(
         bundle.node().as_str(),
         &format!("{}.local.", bundle.node()),
         addresses,
-        0,
+        session_port,
         &properties[..],
     )
     .map(ServiceInfo::enable_addr_auto)
@@ -527,6 +541,7 @@ mod tests {
             HostPlatform::LinuxWayland,
             capabilities(),
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)),
+            24_800,
         )
         .unwrap_or_else(|error| panic!("advertisement failed: {error}"))
         .as_resolved_service()
@@ -545,6 +560,7 @@ mod tests {
             discovered.addresses().iter().next(),
             Some(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)))
         );
+        assert_eq!(discovered.session_port(), 24_800);
         assert_eq!(
             discovered.pairing_bundle().fingerprint(),
             discovered.fingerprint()
@@ -591,6 +607,7 @@ mod tests {
             HostPlatform::Windows,
             capabilities(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
         )
         .unwrap_or_else(|error| panic!("advertisement failed: {error}"));
         let mut properties = service

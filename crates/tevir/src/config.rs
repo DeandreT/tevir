@@ -22,7 +22,9 @@ pub enum Role {
         topology: Topology,
     },
     Agent {
+        controller_node: NodeId,
         controller: SocketAddr,
+        display_size: Size,
     },
 }
 
@@ -32,6 +34,13 @@ impl Config {
             && topology.screen(&node).is_none()
         {
             return Err(ConfigError::MissingLocalScreen(node));
+        }
+        if let Role::Agent {
+            controller_node, ..
+        } = &role
+            && controller_node == &node
+        {
+            return Err(ConfigError::LocalController(node));
         }
         Ok(Self { node, role })
     }
@@ -84,7 +93,16 @@ impl ConfigFile {
                     topology: Topology::new(placements)?,
                 }
             }
-            RoleFile::Agent { controller } => Role::Agent { controller },
+            RoleFile::Agent {
+                controller_node,
+                controller,
+                display_width,
+                display_height,
+            } => Role::Agent {
+                controller_node,
+                controller,
+                display_size: Size::new(display_width, display_height),
+            },
         };
 
         Config::new(self.node.id, role)
@@ -102,8 +120,15 @@ impl From<&Config> for ConfigFile {
                     .map(Screen::from_placement)
                     .collect(),
             },
-            Role::Agent { controller } => RoleFile::Agent {
+            Role::Agent {
+                controller_node,
+                controller,
+                display_size,
+            } => RoleFile::Agent {
+                controller_node: controller_node.clone(),
                 controller: *controller,
+                display_width: display_size.width,
+                display_height: display_size.height,
             },
         };
         Self {
@@ -129,7 +154,10 @@ enum RoleFile {
         screens: Vec<Screen>,
     },
     Agent {
+        controller_node: NodeId,
         controller: SocketAddr,
+        display_width: NonZeroU32,
+        display_height: NonZeroU32,
     },
 }
 
@@ -196,6 +224,8 @@ pub enum ConfigError {
     Topology(#[from] TopologyError),
     #[error("controller node `{0}` is missing from `role.screens`")]
     MissingLocalScreen(NodeId),
+    #[error("agent node `{0}` cannot use itself as its controller")]
+    LocalController(NodeId),
 }
 
 #[cfg(test)]
@@ -272,11 +302,43 @@ mod tests {
 
                 [role]
                 kind = "agent"
+                controller_node = "left"
                 controller = "192.0.2.1:24800"
+                display_width = 2560
+                display_height = 1440
             "#,
         );
 
         assert!(matches!(result, Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn parses_an_agent_controller_and_display() {
+        let config = Config::parse(
+            r#"
+                [node]
+                id = "right"
+
+                [role]
+                kind = "agent"
+                controller_node = "left"
+                controller = "192.0.2.1:24800"
+                display_width = 2560
+                display_height = 1440
+            "#,
+        )
+        .unwrap_or_else(|error| panic!("configuration should be valid: {error}"));
+
+        assert!(matches!(
+            config.role,
+            Role::Agent {
+                controller_node,
+                display_size,
+                ..
+            } if controller_node.as_str() == "left"
+                && display_size.width.get() == 2560
+                && display_size.height.get() == 1440
+        ));
     }
 
     #[test]

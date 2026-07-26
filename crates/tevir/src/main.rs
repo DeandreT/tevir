@@ -149,8 +149,12 @@ fn check_config(path: &std::path::Path) -> Result<(), CliError> {
             config.node,
             topology.screens().len()
         ),
-        Role::Agent { controller } => println!(
-            "valid agent configuration for `{}`: controller at {controller}",
+        Role::Agent {
+            controller_node,
+            controller,
+            ..
+        } => println!(
+            "valid agent configuration for `{}`: controller `{controller_node}` at {controller}",
             config.node
         ),
     }

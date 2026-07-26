@@ -8,8 +8,8 @@ use std::{
 use discovery::{DiscoveredNode, DiscoveryService, NearbyNodes};
 use domain::{NodeId, Point, Rect, ScreenPlacement, Size, Topology};
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportBuilder,
+    self, Align, Button, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Layout,
+    Margin, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportBuilder,
 };
 use identity::{IdentityStore, LocalIdentity, PairingBundle, TrustStore};
 use platform::{EnvironmentStatus, PlatformReport};
@@ -183,6 +183,7 @@ impl DesktopApp {
             identity.pairing_bundle(),
             self.report.platform,
             advertised_capabilities(),
+            self.config_editor.discovery_port(),
         ) {
             Ok(discovery) => self.discovery = Some(discovery),
             Err(error) => {
@@ -231,6 +232,12 @@ impl DesktopApp {
                 tracing::info!(peer = %node, "peer trusted");
                 self.pairing_bundle_input.clear();
                 self.pairing_code_input.clear();
+                if self.config_editor.role == ConfigRole::Agent
+                    && self.config_editor.controller_node == "peer-node"
+                {
+                    self.config_editor.controller_node = node.to_string();
+                    self.use_discovered_controller_address();
+                }
                 self.notice = Some(Notice::success(format!("Paired with {node}")));
             }
             Err(error) => {
@@ -286,6 +293,7 @@ impl DesktopApp {
                 self.config_editor = ConfigEditor::from_config(&config);
                 self.config_summary = Some(config_summary(&config));
                 self.remember_config_path(&path);
+                self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration loaded");
                 self.notice = Some(Notice::success("Configuration loaded"));
             }
@@ -319,6 +327,7 @@ impl DesktopApp {
             Ok(()) => {
                 self.config_summary = Some(config_summary(&config));
                 self.remember_config_path(&path);
+                self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration saved");
                 self.notice = Some(Notice::success("Configuration saved"));
             }
@@ -556,16 +565,111 @@ impl DesktopApp {
         ui.add_space(22.0);
         match self.config_editor.role {
             ConfigRole::Controller => self.controller_configuration(ui),
-            ConfigRole::Agent => {
-                section_heading(ui, "Controller endpoint", "IP address and port");
-                ui.add_space(10.0);
-                labeled_text_field(
-                    ui,
-                    "Controller address",
-                    &mut self.config_editor.controller_address,
-                    "192.0.2.10:24800",
-                );
-            }
+            ConfigRole::Agent => self.agent_configuration(ui),
+        }
+    }
+
+    fn agent_configuration(&mut self, ui: &mut Ui) {
+        let trusted_nodes = self
+            .trust
+            .as_ref()
+            .map(|trust| {
+                trust
+                    .peers()
+                    .map(|peer| peer.node().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if self.config_editor.controller_node == "peer-node" && trusted_nodes.len() == 1 {
+            self.config_editor.controller_node = trusted_nodes[0].clone();
+        }
+
+        section_heading(ui, "Controller endpoint", "Trusted node and address");
+        ui.add_space(10.0);
+        ui.label(RichText::new("Controller node").color(MUTED));
+        let previous_node = self.config_editor.controller_node.clone();
+        ComboBox::from_id_salt("agent-controller-node")
+            .selected_text(&self.config_editor.controller_node)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for node in &trusted_nodes {
+                    ui.selectable_value(
+                        &mut self.config_editor.controller_node,
+                        node.clone(),
+                        node,
+                    );
+                }
+            });
+        if trusted_nodes.is_empty() {
+            status_label(ui, "No trusted controller", WARNING);
+        }
+        if previous_node != self.config_editor.controller_node {
+            self.use_discovered_controller_address();
+        }
+        ui.add_space(8.0);
+        labeled_text_field(
+            ui,
+            "Controller address",
+            &mut self.config_editor.controller_address,
+            "192.0.2.10:24800",
+        );
+        if self.discovered_controller_address().is_some()
+            && ui.button("Use discovered address").clicked()
+        {
+            self.use_discovered_controller_address();
+        }
+
+        ui.add_space(26.0);
+        ui.horizontal(|ui| {
+            section_heading(ui, "Local screen", "Physical pixel dimensions");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Use current monitor").clicked() {
+                    self.use_current_monitor(ui.ctx());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        ui.columns(2, |columns| {
+            compact_text_field(
+                &mut columns[0],
+                "Width",
+                &mut self.config_editor.agent_width,
+                "1920",
+            );
+            compact_text_field(
+                &mut columns[1],
+                "Height",
+                &mut self.config_editor.agent_height,
+                "1080",
+            );
+        });
+    }
+
+    fn discovered_controller_address(&self) -> Option<SocketAddr> {
+        let discovered = self
+            .nearby
+            .iter()
+            .find(|node| node.node().as_str() == self.config_editor.controller_node)?;
+        let port = discovered.session_port();
+        if port == 0 {
+            return None;
+        }
+        let address = discovered
+            .addresses()
+            .iter()
+            .find(|address| address.is_ipv4())
+            .or_else(|| discovered.addresses().iter().next())?;
+        Some(SocketAddr::new(*address, port))
+    }
+
+    fn use_discovered_controller_address(&mut self) {
+        if let Some(address) = self.discovered_controller_address() {
+            self.config_editor.controller_address = address.to_string();
+            tracing::info!(
+                controller = %self.config_editor.controller_node,
+                %address,
+                "controller address filled from discovery"
+            );
         }
     }
 
@@ -670,10 +774,16 @@ impl DesktopApp {
             self.notice = Some(Notice::error("Current monitor dimensions are unavailable"));
             return;
         };
-        match self
-            .config_editor
-            .set_local_monitor(local_node, width, height)
-        {
+        let result = match self.config_editor.role {
+            ConfigRole::Controller => self
+                .config_editor
+                .set_local_monitor(local_node, width, height),
+            ConfigRole::Agent => {
+                self.config_editor.set_agent_monitor(width, height);
+                Ok(())
+            }
+        };
+        match result {
             Ok(()) => {
                 tracing::info!(width, height, "local monitor dimensions detected");
                 self.notice = Some(Notice::success(format!(
@@ -818,7 +928,7 @@ impl DesktopApp {
         section_heading(
             ui,
             "Trusted nodes",
-            &format!("{} paired", self.peer_count()),
+            &format!("{} stored on this node", self.peer_count()),
         );
         ui.add_space(10.0);
         let peers = self
@@ -1202,7 +1312,13 @@ fn format_discovered_node(node: &DiscoveredNode) -> String {
     let addresses = node
         .addresses()
         .iter()
-        .map(ToString::to_string)
+        .map(|address| {
+            if node.session_port() == 0 {
+                address.to_string()
+            } else {
+                SocketAddr::new(*address, node.session_port()).to_string()
+            }
+        })
         .collect::<Vec<_>>();
     if addresses.is_empty() {
         format!("{platform} | address pending")
@@ -1245,7 +1361,10 @@ enum ConfigRole {
 struct ConfigEditor {
     role: ConfigRole,
     listen_address: String,
+    controller_node: String,
     controller_address: String,
+    agent_width: String,
+    agent_height: String,
     screens: Vec<ScreenEditor>,
     selected_screen: usize,
     canvas_view: Option<CanvasView>,
@@ -1257,7 +1376,10 @@ impl ConfigEditor {
         Self {
             role: ConfigRole::Controller,
             listen_address: String::from("0.0.0.0:24800"),
+            controller_node: String::from("peer-node"),
             controller_address: String::from("127.0.0.1:24800"),
+            agent_width: String::from("1920"),
+            agent_height: String::from("1080"),
             screens: vec![ScreenEditor {
                 node: node.map_or_else(|| String::from("local-node"), ToString::to_string),
                 x: String::from("0"),
@@ -1276,7 +1398,10 @@ impl ConfigEditor {
             Role::Controller { listen, topology } => Self {
                 role: ConfigRole::Controller,
                 listen_address: listen.to_string(),
+                controller_node: String::from("peer-node"),
                 controller_address: String::from("127.0.0.1:24800"),
+                agent_width: String::from("1920"),
+                agent_height: String::from("1080"),
                 screens: topology
                     .screens()
                     .iter()
@@ -1286,10 +1411,17 @@ impl ConfigEditor {
                 canvas_view: None,
                 drag_origin: None,
             },
-            Role::Agent { controller } => Self {
+            Role::Agent {
+                controller_node,
+                controller,
+                display_size,
+            } => Self {
                 role: ConfigRole::Agent,
                 listen_address: String::from("0.0.0.0:24800"),
+                controller_node: controller_node.to_string(),
                 controller_address: controller.to_string(),
+                agent_width: display_size.width.to_string(),
+                agent_height: display_size.height.to_string(),
                 screens: vec![ScreenEditor::from_local_node(&config.node)],
                 selected_screen: 0,
                 canvas_view: None,
@@ -1311,9 +1443,21 @@ impl ConfigEditor {
                 let topology = Topology::new(screens).map_err(|error| error.to_string())?;
                 Role::Controller { listen, topology }
             }
-            ConfigRole::Agent => Role::Agent {
-                controller: parse_socket_address("Controller address", &self.controller_address)?,
-            },
+            ConfigRole::Agent => {
+                let controller_node = NodeId::new(self.controller_node.trim())
+                    .map_err(|error| format!("Controller node: {error}"))?;
+                Role::Agent {
+                    controller_node,
+                    controller: parse_socket_address(
+                        "Controller address",
+                        &self.controller_address,
+                    )?,
+                    display_size: Size::new(
+                        parse_nonzero("Agent screen width", &self.agent_width)?,
+                        parse_nonzero("Agent screen height", &self.agent_height)?,
+                    ),
+                }
+            }
         };
         Config::new(node, role).map_err(|error| error.to_string())
     }
@@ -1322,6 +1466,17 @@ impl ConfigEditor {
         self.screens
             .iter()
             .any(|screen| screen.node.trim() == node.as_str())
+    }
+
+    fn discovery_port(&self) -> u16 {
+        match self.role {
+            ConfigRole::Controller => self
+                .listen_address
+                .trim()
+                .parse::<SocketAddr>()
+                .map_or(0, |address| address.port()),
+            ConfigRole::Agent => 0,
+        }
     }
 
     fn add_screen(&mut self, node: String) {
@@ -1380,6 +1535,11 @@ impl ConfigEditor {
         self.selected_screen = index;
         self.canvas_view = None;
         Ok(())
+    }
+
+    fn set_agent_monitor(&mut self, width: u32, height: u32) {
+        self.agent_width = width.to_string();
+        self.agent_height = height.to_string();
     }
 
     fn move_screen(&mut self, index: usize, x: i32, y: i32) {
@@ -1789,9 +1949,14 @@ fn config_summary(config: &Config) -> String {
             config.node,
             topology.screens().len()
         ),
-        Role::Agent { controller } => {
-            format!("Agent {} | controller {controller}", config.node)
-        }
+        Role::Agent {
+            controller_node,
+            controller,
+            ..
+        } => format!(
+            "Agent {} | controller {controller_node} at {controller}",
+            config.node
+        ),
     }
 }
 
@@ -1846,6 +2011,7 @@ pub enum AppError {
 #[cfg(test)]
 mod tests {
     use domain::NodeId;
+    use identity::IdentityStore;
     use tempfile::TempDir;
 
     use super::{ConfigEditor, ConfigRole, DesktopApp, ScreenEditor, ScreenGeometry};
@@ -1869,6 +2035,50 @@ mod tests {
             Some(&node)
         );
         assert!(app.trust.is_some());
+    }
+
+    #[test]
+    fn trusted_nodes_survive_a_desktop_restart() {
+        let directory =
+            TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
+        let remote_directory =
+            TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
+        let local = NodeId::new("studio-left")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let remote_node = NodeId::new("studio-right")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let remote = IdentityStore::new(remote_directory.path())
+            .load_or_create(&remote_node)
+            .unwrap_or_else(|error| panic!("remote identity should be created: {error}"));
+        let bundle = remote.pairing_bundle();
+        let code = bundle.code().to_string();
+
+        let mut app = DesktopApp::load(
+            directory.path().to_path_buf(),
+            Some(local.clone()),
+            telemetry::LogBuffer::default(),
+        )
+        .unwrap_or_else(|error| panic!("desktop initialization failed: {error}"));
+        app.trust
+            .as_mut()
+            .unwrap_or_else(|| panic!("trust store should be available"))
+            .trust(bundle, &code)
+            .unwrap_or_else(|error| panic!("peer should be trusted: {error}"));
+        drop(app);
+
+        let reloaded = DesktopApp::load(
+            directory.path().to_path_buf(),
+            Some(local),
+            telemetry::LogBuffer::default(),
+        )
+        .unwrap_or_else(|error| panic!("desktop restart failed: {error}"));
+
+        assert!(
+            reloaded
+                .trust
+                .as_ref()
+                .is_some_and(|trust| trust.get(&remote_node).is_some())
+        );
     }
 
     #[test]

@@ -3,5 +3,7 @@ id = "right-desk"
 
 [role]
 kind = "agent"
+controller_node = "left-desk"
 controller = "192.0.2.10:24800"
-
+display_width = 2560
+display_height = 1440
