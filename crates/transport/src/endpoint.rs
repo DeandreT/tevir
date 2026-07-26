@@ -425,7 +425,42 @@ impl PeerConnection {
         )
     }
 
+    #[must_use]
+    pub fn clipboard_endpoint(&self) -> ClipboardEndpoint {
+        ClipboardEndpoint {
+            connection: self.connection.clone(),
+            maximum_frame_bytes: self.maximum_clipboard_frame_bytes,
+            operation_timeout: self.operation_timeout,
+        }
+    }
+
     pub async fn open_clipboard(&self) -> Result<ClipboardStream, TransportError> {
+        self.clipboard_endpoint().open().await
+    }
+
+    pub async fn accept_clipboard(&self) -> Result<ClipboardStream, TransportError> {
+        self.clipboard_endpoint().accept().await
+    }
+
+    pub fn close(&self) {
+        tracing::info!(peer = %self.info.peer, session_id = self.info.session_id, "closing peer session");
+        self.connection.close(VarInt::from_u32(0), b"closed");
+    }
+
+    pub async fn closed(&self) {
+        let _reason = self.connection.closed().await;
+    }
+}
+
+#[derive(Clone)]
+pub struct ClipboardEndpoint {
+    connection: Connection,
+    maximum_frame_bytes: usize,
+    operation_timeout: Duration,
+}
+
+impl ClipboardEndpoint {
+    pub async fn open(&self) -> Result<ClipboardStream, TransportError> {
         let (mut send, receive) =
             operation(self.operation_timeout, "opening clipboard stream", async {
                 self.connection
@@ -440,12 +475,12 @@ impl PeerConnection {
         Ok(ClipboardStream {
             send,
             receive,
-            maximum_frame_bytes: self.maximum_clipboard_frame_bytes,
+            maximum_frame_bytes: self.maximum_frame_bytes,
             operation_timeout: self.operation_timeout,
         })
     }
 
-    pub async fn accept_clipboard(&self) -> Result<ClipboardStream, TransportError> {
+    pub async fn accept(&self) -> Result<ClipboardStream, TransportError> {
         let (send, mut receive) = operation(
             self.operation_timeout,
             "accepting clipboard stream",
@@ -463,18 +498,9 @@ impl PeerConnection {
         Ok(ClipboardStream {
             send,
             receive,
-            maximum_frame_bytes: self.maximum_clipboard_frame_bytes,
+            maximum_frame_bytes: self.maximum_frame_bytes,
             operation_timeout: self.operation_timeout,
         })
-    }
-
-    pub fn close(&self) {
-        tracing::info!(peer = %self.info.peer, session_id = self.info.session_id, "closing peer session");
-        self.connection.close(VarInt::from_u32(0), b"closed");
-    }
-
-    pub async fn closed(&self) {
-        let _reason = self.connection.closed().await;
     }
 }
 
@@ -855,6 +881,37 @@ mod tests {
             .unwrap_or_else(|error| panic!("clipboard send failed: {error}"));
         assert_eq!(
             server_clipboard
+                .receive()
+                .await
+                .unwrap_or_else(|error| panic!("clipboard receive failed: {error}")),
+            transfer
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_endpoint_survives_control_stream_split() {
+        let (server_connection, client_connection) = connected_pair().await;
+        let server_clipboard = server_connection.clipboard_endpoint();
+        let client_clipboard = client_connection.clipboard_endpoint();
+        let (_server_sender, _server_receiver) = server_connection.split_control();
+        let (_client_sender, _client_receiver) = client_connection.split_control();
+
+        let (accepted, opened) = tokio::join!(server_clipboard.accept(), client_clipboard.open());
+        let mut accepted =
+            accepted.unwrap_or_else(|error| panic!("clipboard accept failed: {error}"));
+        let mut opened = opened.unwrap_or_else(|error| panic!("clipboard open failed: {error}"));
+        let transfer = ClipboardText::new(
+            ClipboardGeneration::new(node("right"), NonZeroU64::new(2).unwrap_or(NonZeroU64::MIN)),
+            "after split",
+        )
+        .unwrap_or_else(|error| panic!("clipboard payload failed: {error}"));
+
+        opened
+            .send(&transfer)
+            .await
+            .unwrap_or_else(|error| panic!("clipboard send failed: {error}"));
+        assert_eq!(
+            accepted
                 .receive()
                 .await
                 .unwrap_or_else(|error| panic!("clipboard receive failed: {error}")),

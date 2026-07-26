@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -9,16 +10,21 @@ use std::{
 use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Topology};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
-    BackendKind, CaptureService, CaptureServiceEvent, DesktopGeometry, InjectionService,
-    InjectionServiceEvent,
+    BackendKind, CaptureService, CaptureServiceEvent, ClipboardService, ClipboardServiceEvent,
+    DesktopGeometry, InjectionService, InjectionServiceEvent,
 };
-use protocol::{Capabilities, Session};
-use session::{AgentAction, AgentSession, ControllerAction, ControllerSession};
+use protocol::{
+    Capabilities, ClipboardGeneration, ClipboardText, MAX_CLIPBOARD_TEXT_BYTES, Session,
+};
+use session::{
+    AgentAction, AgentSession, ClipboardAction, ClipboardSession, ControllerAction,
+    ControllerSession,
+};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 use transport::{
-    ControlReceiver, ControlSender, PeerConnection, ReconnectPolicy, SecureClient, SecureServer,
-    SessionLimits, SessionProfile, TransportError,
+    ClipboardEndpoint, ControlReceiver, ControlSender, PeerConnection, ReconnectPolicy,
+    SecureClient, SecureServer, SessionLimits, SessionProfile, TransportError,
 };
 
 use crate::config::{Config, EdgeBehavior, Role};
@@ -28,6 +34,7 @@ const EVENT_CAPACITY: usize = 256;
 const ACCEPT_CAPACITY: usize = 8;
 const NETWORK_EVENT_CAPACITY: usize = 256;
 const OUTBOUND_CAPACITY: usize = 128;
+const CLIPBOARD_OUTBOUND_CAPACITY: usize = 8;
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -181,6 +188,13 @@ pub enum RuntimeEvent {
     DisplayChanged {
         screen: ScreenPlacement,
     },
+    ClipboardReady {
+        backend: BackendKind,
+    },
+    ClipboardSynchronized {
+        peer: NodeId,
+        received: bool,
+    },
     ConfigurationApplied,
     Error {
         message: String,
@@ -252,6 +266,21 @@ fn run_worker(
             return;
         }
     };
+    let clipboard = match ClipboardService::start(
+        NonZeroUsize::new(MAX_CLIPBOARD_TEXT_BYTES).unwrap_or(NonZeroUsize::MIN),
+    ) {
+        Ok(clipboard) => Some(clipboard),
+        Err(error) => {
+            tracing::warn!(%error, "clipboard synchronization is unavailable");
+            send_event(
+                &events,
+                RuntimeEvent::Error {
+                    message: format!("Clipboard synchronization is unavailable: {error}"),
+                },
+            );
+            None
+        }
+    };
     let result = match (config.role.clone(), native_input) {
         (
             Role::Controller {
@@ -269,6 +298,7 @@ fn run_worker(
                 identity,
                 trust,
                 capture.clone(),
+                clipboard,
                 commands,
                 events.clone(),
             ));
@@ -291,6 +321,7 @@ fn run_worker(
             identity,
             trust,
             injection.clone(),
+            clipboard,
             commands,
             events.clone(),
         )),
@@ -320,6 +351,7 @@ async fn run_controller(
     identity: LocalIdentity,
     trust: TrustStore,
     capture: CaptureService,
+    clipboard: Option<ClipboardService>,
     mut commands: tokio_mpsc::Receiver<RuntimeCommand>,
     events: SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
@@ -329,7 +361,7 @@ async fn run_controller(
             role: RuntimeRole::Controller,
         },
     );
-    let profile = session_profile();
+    let profile = session_profile(clipboard.is_some());
     let server = SecureServer::bind(listen, identity, &trust, profile, SessionLimits::default())
         .map_err(|error| RuntimeError::Transport(error.to_string()))?;
     let address = server
@@ -366,6 +398,7 @@ async fn run_controller(
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_nonce = 0u64;
+    let mut clipboard_state = ClipboardRuntimeState::new(clipboard);
     let mut edge_state = EdgeState {
         behavior: edge_behavior,
         pending_activation: None,
@@ -426,6 +459,7 @@ async fn run_controller(
                     Ok(connection) => {
                         accept_controller_peer(
                             connection,
+                            &local_node,
                             &topology,
                             &mut controller,
                             &mut peers,
@@ -449,6 +483,7 @@ async fn run_controller(
                         &mut controller,
                         &capture,
                         &mut peers,
+                        &mut clipboard_state,
                         &events,
                     )?;
                 }
@@ -474,6 +509,7 @@ async fn run_controller(
                     .flush()
                     .map_err(|error| RuntimeError::Session(error.to_string()))?;
                 apply_controller_actions(actions, &capture, &peers, &events)?;
+                drain_controller_clipboard(&local_node, &mut peers, &mut clipboard_state, &events)?;
             }
             _ = heartbeat_tick.tick() => {
                 heartbeat_nonce = heartbeat_nonce.wrapping_add(1);
@@ -514,6 +550,7 @@ fn spawn_accept_worker(
 
 fn accept_controller_peer(
     connection: PeerConnection,
+    local_node: &NodeId,
     topology: &Topology,
     controller: &mut ControllerSession,
     peers: &mut BTreeMap<NodeId, ActivePeer>,
@@ -537,12 +574,25 @@ fn accept_controller_peer(
     controller
         .reset_peer(&info.peer)
         .map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let clipboard = info.negotiated_capabilities.clipboard_text.then(|| {
+        let outbound = spawn_clipboard_worker(
+            connection.clipboard_endpoint(),
+            info.peer.clone(),
+            info.session_id,
+            network_tx.clone(),
+        );
+        ActiveClipboard {
+            session: ClipboardSession::new(local_node.clone(), info.peer.clone()),
+            outbound,
+        }
+    });
     let outbound = spawn_connection_worker(connection, network_tx.clone());
     peers.insert(
         info.peer.clone(),
         ActivePeer {
             session_id: info.session_id,
             outbound,
+            clipboard,
         },
     );
     tracing::info!(peer = %info.peer, session_id = info.session_id, "controller peer connected");
@@ -775,12 +825,148 @@ fn apply_controller_actions(
     Ok(())
 }
 
+fn drain_controller_clipboard(
+    local_node: &NodeId,
+    peers: &mut BTreeMap<NodeId, ActivePeer>,
+    state: &mut ClipboardRuntimeState,
+    events: &SyncSender<RuntimeEvent>,
+) -> Result<(), RuntimeError> {
+    let native_events = state.service.as_ref().map_or_else(Vec::new, |service| {
+        std::iter::from_fn(|| service.try_recv().ok()).collect()
+    });
+    for event in native_events {
+        match event {
+            ClipboardServiceEvent::Ready { backend } => {
+                send_event(events, RuntimeEvent::ClipboardReady { backend });
+            }
+            ClipboardServiceEvent::Changed { text } => {
+                let peer_ids = peers
+                    .iter()
+                    .filter(|(_, active)| active.clipboard.is_some())
+                    .map(|(peer, _)| peer.clone())
+                    .collect::<Vec<_>>();
+                for peer in peer_ids {
+                    let actions = peers
+                        .get_mut(&peer)
+                        .and_then(|active| active.clipboard.as_mut())
+                        .ok_or_else(|| RuntimeError::Session(String::from("clipboard peer lost")))?
+                        .session
+                        .local_changed(text.clone())
+                        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                    apply_controller_clipboard_actions(&peer, actions, peers, state)?;
+                }
+                tracing::debug!(node = %local_node, bytes = text.len(), "local clipboard offered");
+            }
+            ClipboardServiceEvent::Applied => {
+                let Some((peer, generation)) = state.applications.pending.take() else {
+                    return Err(RuntimeError::Session(String::from(
+                        "native clipboard applied without a pending generation",
+                    )));
+                };
+                let Some(clipboard) = peers
+                    .get_mut(&peer)
+                    .and_then(|active| active.clipboard.as_mut())
+                else {
+                    tracing::debug!(%peer, "clipboard peer disconnected during application");
+                    continue;
+                };
+                let actions = clipboard
+                    .session
+                    .confirm_applied(&generation)
+                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                apply_controller_clipboard_actions(&peer, actions, peers, state)?;
+                send_event(
+                    events,
+                    RuntimeEvent::ClipboardSynchronized {
+                        peer,
+                        received: true,
+                    },
+                );
+            }
+            ClipboardServiceEvent::Failed { operation, reason } => {
+                tracing::warn!(operation, %reason, "clipboard service failed");
+                send_event(
+                    events,
+                    RuntimeEvent::Error {
+                        message: format!("Clipboard synchronization stopped: {reason}"),
+                    },
+                );
+                state.service.take();
+                state.applications = ClipboardApplications::new();
+            }
+            ClipboardServiceEvent::Stopped => {
+                state.service.take();
+                state.applications = ClipboardApplications::new();
+                tracing::warn!("native clipboard service stopped");
+            }
+        }
+    }
+    start_next_clipboard_application(state.service.as_ref(), &mut state.applications)
+}
+
+fn apply_controller_clipboard_actions(
+    peer: &NodeId,
+    actions: Vec<ClipboardAction>,
+    peers: &BTreeMap<NodeId, ActivePeer>,
+    state: &mut ClipboardRuntimeState,
+) -> Result<(), RuntimeError> {
+    for action in actions {
+        match action {
+            ClipboardAction::SendControl(control) => peers
+                .get(peer)
+                .ok_or_else(|| RuntimeError::Session(format!("clipboard peer `{peer}` is gone")))?
+                .outbound
+                .try_send(Session::Clipboard(control))
+                .map_err(|_| RuntimeError::OutboundQueue(peer.clone()))?,
+            ClipboardAction::SendTransfer(transfer) => peers
+                .get(peer)
+                .and_then(|active| active.clipboard.as_ref())
+                .ok_or_else(|| {
+                    RuntimeError::Session(format!("clipboard peer `{peer}` is unavailable"))
+                })?
+                .outbound
+                .try_send(transfer)
+                .map_err(|_| {
+                    RuntimeError::Session(format!("clipboard transfer queue for `{peer}` is full"))
+                })?,
+            ClipboardAction::ApplyRemote(transfer) => {
+                state
+                    .applications
+                    .queued
+                    .push_back((peer.clone(), transfer));
+            }
+        }
+    }
+    start_next_clipboard_application(state.service.as_ref(), &mut state.applications)
+}
+
+fn start_next_clipboard_application(
+    service: Option<&ClipboardService>,
+    applications: &mut ClipboardApplications,
+) -> Result<(), RuntimeError> {
+    if applications.pending.is_some() {
+        return Ok(());
+    }
+    let Some((peer, transfer)) = applications.queued.pop_front() else {
+        return Ok(());
+    };
+    let service = service.ok_or_else(|| {
+        RuntimeError::Native(String::from("native clipboard service is unavailable"))
+    })?;
+    service
+        .apply(transfer.text())
+        .map_err(|error| RuntimeError::Native(error.to_string()))?;
+    applications.pending = Some((peer, transfer.generation().clone()));
+    Ok(())
+}
+
 fn handle_controller_network(
     event: NetworkEvent,
     topology: &mut Topology,
     controller: &mut ControllerSession,
     capture: &CaptureService,
     peers: &mut BTreeMap<NodeId, ActivePeer>,
+    clipboard_state: &mut ClipboardRuntimeState,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
     match event {
@@ -853,6 +1039,30 @@ fn handle_controller_network(
                 }
             }
             Session::HeartbeatAcknowledged { .. } => {}
+            Session::Clipboard(control) => {
+                let acknowledged = matches!(&control, protocol::ClipboardControl::Applied { .. });
+                let actions = peers
+                    .get_mut(&peer)
+                    .and_then(|active| active.clipboard.as_mut())
+                    .ok_or_else(|| {
+                        RuntimeError::Session(format!(
+                            "peer `{peer}` sent clipboard control without negotiating it"
+                        ))
+                    })?
+                    .session
+                    .receive_control(control)
+                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                apply_controller_clipboard_actions(&peer, actions, peers, clipboard_state)?;
+                if acknowledged {
+                    send_event(
+                        events,
+                        RuntimeEvent::ClipboardSynchronized {
+                            peer,
+                            received: false,
+                        },
+                    );
+                }
+            }
             Session::Disconnect => {
                 disconnect_controller_peer(
                     peer,
@@ -864,7 +1074,7 @@ fn handle_controller_network(
                     events,
                 )?;
             }
-            Session::FocusChanged { .. } | Session::Input(_) | Session::Clipboard(_) => {
+            Session::FocusChanged { .. } | Session::Input(_) => {
                 send_event(
                     events,
                     RuntimeEvent::Error {
@@ -880,7 +1090,46 @@ fn handle_controller_network(
         } => disconnect_controller_peer(
             peer, session_id, reason, controller, capture, peers, events,
         )?,
+        NetworkEvent::ClipboardTransfer {
+            peer,
+            session_id,
+            transfer,
+        } if active_session(peers, &peer, session_id) => {
+            let actions = peers
+                .get_mut(&peer)
+                .and_then(|active| active.clipboard.as_mut())
+                .ok_or_else(|| {
+                    RuntimeError::Session(format!(
+                        "peer `{peer}` sent clipboard data without negotiating it"
+                    ))
+                })?
+                .session
+                .receive_transfer(transfer)
+                .map_err(|error| RuntimeError::Session(error.to_string()))?;
+            apply_controller_clipboard_actions(&peer, actions, peers, clipboard_state)?;
+        }
+        NetworkEvent::ClipboardFailed {
+            peer,
+            session_id,
+            reason,
+        } if active_session(peers, &peer, session_id) => {
+            if let Some(active) = peers.get_mut(&peer) {
+                active.clipboard = None;
+            }
+            clipboard_state
+                .applications
+                .queued
+                .retain(|(queued_peer, _)| queued_peer != &peer);
+            tracing::warn!(%peer, %reason, "clipboard transfer worker stopped");
+            send_event(
+                events,
+                RuntimeEvent::Error {
+                    message: format!("Clipboard synchronization with `{peer}` stopped: {reason}"),
+                },
+            );
+        }
         NetworkEvent::Message { .. } => {}
+        NetworkEvent::ClipboardTransfer { .. } | NetworkEvent::ClipboardFailed { .. } => {}
     }
     Ok(())
 }
@@ -936,6 +1185,7 @@ async fn run_agent(
     identity: LocalIdentity,
     trust: TrustStore,
     injection: InjectionService,
+    clipboard: Option<ClipboardService>,
     mut commands: tokio_mpsc::Receiver<RuntimeCommand>,
     events: SyncSender<RuntimeEvent>,
 ) -> Result<(), RuntimeError> {
@@ -953,7 +1203,7 @@ async fn run_agent(
         bind_address,
         identity,
         &trust,
-        session_profile(),
+        session_profile(clipboard.is_some()),
         SessionLimits::default(),
     )
     .map_err(|error| RuntimeError::Transport(error.to_string()))?;
@@ -1005,7 +1255,10 @@ async fn run_agent(
                     &local_node,
                     &controller_node,
                     &mut display_geometry,
-                    &injection,
+                    AgentNativeServices {
+                        injection: &injection,
+                        clipboard: clipboard.as_ref(),
+                    },
                     connection,
                     &mut commands,
                     &events,
@@ -1054,11 +1307,15 @@ async fn run_agent_connection(
     local_node: &NodeId,
     controller_node: &NodeId,
     display_geometry: &mut DesktopGeometry,
-    injection: &InjectionService,
+    native: AgentNativeServices<'_>,
     connection: PeerConnection,
     commands: &mut tokio_mpsc::Receiver<RuntimeCommand>,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<AgentConnectionOutcome, RuntimeError> {
+    let AgentNativeServices {
+        injection,
+        clipboard,
+    } = native;
     while let Ok(event) = injection.try_recv() {
         match event {
             InjectionServiceEvent::Ready { backend } => {
@@ -1081,6 +1338,20 @@ async fn run_agent_connection(
     let injection_generation = injection
         .begin_session()
         .map_err(|error| RuntimeError::Native(error.to_string()))?;
+    let connection_info = connection.info().clone();
+    let (clipboard_event_tx, mut clipboard_events) = tokio_mpsc::channel(NETWORK_EVENT_CAPACITY);
+    let mut active_clipboard = (clipboard.is_some()
+        && connection_info.negotiated_capabilities.clipboard_text)
+        .then(|| AgentClipboard {
+            session: ClipboardSession::new(local_node.clone(), controller_node.clone()),
+            outbound: spawn_clipboard_worker(
+                connection.clipboard_endpoint(),
+                controller_node.clone(),
+                connection_info.session_id,
+                clipboard_event_tx,
+            ),
+        });
+    let mut clipboard_applications = ClipboardApplications::new();
     let (mut sender, receiver) = connection.split_control();
     let (mut inbound, reader_worker) = spawn_control_reader(receiver);
     let mut agent = AgentSession::new(local_node.clone(), display_geometry.size());
@@ -1130,6 +1401,33 @@ async fn run_agent_connection(
                         break Ok(AgentConnectionOutcome::Disconnected);
                     }
                 };
+                if let Session::Clipboard(control) = message {
+                    let acknowledged =
+                        matches!(&control, protocol::ClipboardControl::Applied { .. });
+                    let actions = active_clipboard
+                        .as_mut()
+                        .ok_or_else(|| RuntimeError::Session(String::from(
+                            "controller sent clipboard control without negotiating it",
+                        )))?
+                        .session
+                        .receive_control(control)
+                        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                    apply_agent_clipboard_actions(
+                        actions,
+                        active_clipboard.as_ref(),
+                        clipboard,
+                        &mut clipboard_applications,
+                        &mut sender,
+                    )
+                    .await?;
+                    if acknowledged {
+                        send_event(events, RuntimeEvent::ClipboardSynchronized {
+                            peer: controller_node.clone(),
+                            received: false,
+                        });
+                    }
+                    continue 'session;
+                }
                 let actions = agent
                     .handle(message)
                     .map_err(|error| RuntimeError::Session(error.to_string()))?;
@@ -1153,6 +1451,61 @@ async fn run_agent_connection(
                 }
             }
             _ = input_tick.tick() => {
+                drain_agent_clipboard(
+                    controller_node,
+                    clipboard,
+                    &mut active_clipboard,
+                    &mut clipboard_applications,
+                    &mut sender,
+                    events,
+                )
+                .await?;
+                while let Ok(event) = clipboard_events.try_recv() {
+                    match event {
+                        NetworkEvent::ClipboardTransfer {
+                            peer,
+                            session_id,
+                            transfer,
+                        } if peer == *controller_node
+                            && session_id == connection_info.session_id =>
+                        {
+                            let actions = active_clipboard
+                                .as_mut()
+                                .ok_or_else(|| RuntimeError::Session(String::from(
+                                    "controller sent clipboard data without negotiating it",
+                                )))?
+                                .session
+                                .receive_transfer(transfer)
+                                .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                            apply_agent_clipboard_actions(
+                                actions,
+                                active_clipboard.as_ref(),
+                                clipboard,
+                                &mut clipboard_applications,
+                                &mut sender,
+                            )
+                            .await?;
+                        }
+                        NetworkEvent::ClipboardFailed {
+                            peer,
+                            session_id,
+                            reason,
+                        } if peer == *controller_node
+                            && session_id == connection_info.session_id =>
+                        {
+                            active_clipboard = None;
+                            send_event(events, RuntimeEvent::Error {
+                                message: format!(
+                                    "Clipboard synchronization with `{peer}` stopped: {reason}"
+                                ),
+                            });
+                        }
+                        NetworkEvent::Message { .. }
+                        | NetworkEvent::Disconnected { .. }
+                        | NetworkEvent::ClipboardTransfer { .. }
+                        | NetworkEvent::ClipboardFailed { .. } => {}
+                    }
+                }
                 while let Ok(event) = injection.try_recv() {
                     match event {
                         InjectionServiceEvent::Ready { backend } => {
@@ -1284,6 +1637,125 @@ async fn apply_agent_actions(
     Ok(())
 }
 
+async fn drain_agent_clipboard(
+    controller_node: &NodeId,
+    service: Option<&ClipboardService>,
+    clipboard: &mut Option<AgentClipboard>,
+    applications: &mut ClipboardApplications,
+    sender: &mut ControlSender,
+    events: &SyncSender<RuntimeEvent>,
+) -> Result<(), RuntimeError> {
+    let native_events = service.map_or_else(Vec::new, |service| {
+        std::iter::from_fn(|| service.try_recv().ok()).collect()
+    });
+    for event in native_events {
+        match event {
+            ClipboardServiceEvent::Ready { backend } => {
+                send_event(events, RuntimeEvent::ClipboardReady { backend });
+            }
+            ClipboardServiceEvent::Changed { text } => {
+                let Some(active) = clipboard.as_mut() else {
+                    continue;
+                };
+                let actions = active
+                    .session
+                    .local_changed(text)
+                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                apply_agent_clipboard_actions(
+                    actions,
+                    clipboard.as_ref(),
+                    service,
+                    applications,
+                    sender,
+                )
+                .await?;
+            }
+            ClipboardServiceEvent::Applied => {
+                let Some((peer, generation)) = applications.pending.take() else {
+                    return Err(RuntimeError::Session(String::from(
+                        "native clipboard applied without a pending generation",
+                    )));
+                };
+                if peer != *controller_node {
+                    return Err(RuntimeError::Session(format!(
+                        "native clipboard application belongs to unexpected peer `{peer}`"
+                    )));
+                }
+                let Some(active) = clipboard.as_mut() else {
+                    continue;
+                };
+                let actions = active
+                    .session
+                    .confirm_applied(&generation)
+                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                apply_agent_clipboard_actions(
+                    actions,
+                    clipboard.as_ref(),
+                    service,
+                    applications,
+                    sender,
+                )
+                .await?;
+                send_event(
+                    events,
+                    RuntimeEvent::ClipboardSynchronized {
+                        peer,
+                        received: true,
+                    },
+                );
+            }
+            ClipboardServiceEvent::Failed { operation, reason } => {
+                tracing::warn!(operation, %reason, "clipboard service failed");
+                send_event(
+                    events,
+                    RuntimeEvent::Error {
+                        message: format!("Clipboard synchronization stopped: {reason}"),
+                    },
+                );
+                *clipboard = None;
+                *applications = ClipboardApplications::new();
+            }
+            ClipboardServiceEvent::Stopped => {
+                *clipboard = None;
+                *applications = ClipboardApplications::new();
+                tracing::warn!("native clipboard service stopped");
+            }
+        }
+    }
+    start_next_clipboard_application(service, applications)
+}
+
+async fn apply_agent_clipboard_actions(
+    actions: Vec<ClipboardAction>,
+    clipboard: Option<&AgentClipboard>,
+    service: Option<&ClipboardService>,
+    applications: &mut ClipboardApplications,
+    sender: &mut ControlSender,
+) -> Result<(), RuntimeError> {
+    for action in actions {
+        match action {
+            ClipboardAction::SendControl(control) => sender
+                .send(Session::Clipboard(control))
+                .await
+                .map_err(|error| RuntimeError::Transport(error.to_string()))?,
+            ClipboardAction::SendTransfer(transfer) => clipboard
+                .ok_or_else(|| {
+                    RuntimeError::Session(String::from("clipboard transfer channel is unavailable"))
+                })?
+                .outbound
+                .try_send(transfer)
+                .map_err(|_| {
+                    RuntimeError::Session(String::from("clipboard transfer queue is full"))
+                })?,
+            ClipboardAction::ApplyRemote(transfer) => {
+                let peer = transfer.generation().owner.clone();
+                applications.queued.push_back((peer, transfer));
+            }
+        }
+    }
+    start_next_clipboard_application(service, applications)
+}
+
 fn spawn_connection_worker(
     connection: PeerConnection,
     events: tokio_mpsc::Sender<NetworkEvent>,
@@ -1330,6 +1802,66 @@ fn spawn_connection_worker(
                 reason,
             })
             .await;
+    });
+    outbound
+}
+
+fn spawn_clipboard_worker(
+    endpoint: ClipboardEndpoint,
+    peer: NodeId,
+    session_id: u128,
+    events: tokio_mpsc::Sender<NetworkEvent>,
+) -> tokio_mpsc::Sender<ClipboardText> {
+    let (outbound, mut outbound_rx) = tokio_mpsc::channel(CLIPBOARD_OUTBOUND_CAPACITY);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                transfer = outbound_rx.recv() => {
+                    let Some(transfer) = transfer else {
+                        break;
+                    };
+                    let result = async {
+                        let mut stream = endpoint.open().await?;
+                        stream.send(&transfer).await?;
+                        stream.finish()
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        let _ = events.send(NetworkEvent::ClipboardFailed {
+                            peer: peer.clone(),
+                            session_id,
+                            reason: error.to_string(),
+                        }).await;
+                        break;
+                    }
+                }
+                stream = endpoint.accept() => {
+                    let result = match stream {
+                        Ok(mut stream) => stream.receive().await,
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(transfer) => {
+                            if events.send(NetworkEvent::ClipboardTransfer {
+                                peer: peer.clone(),
+                                session_id,
+                                transfer,
+                            }).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = events.send(NetworkEvent::ClipboardFailed {
+                                peer: peer.clone(),
+                                session_id,
+                                reason: error.to_string(),
+                            }).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     });
     outbound
 }
@@ -1519,14 +2051,14 @@ fn shared_edge_offset(
     )
 }
 
-fn session_profile() -> SessionProfile {
+fn session_profile(clipboard_text: bool) -> SessionProfile {
     SessionProfile {
         platform: platform::probe_host().platform,
         capabilities: Capabilities {
             keyboard: true,
             relative_pointer: true,
             absolute_pointer: false,
-            clipboard_text: false,
+            clipboard_text,
         },
     }
 }
@@ -1538,6 +2070,50 @@ fn send_event(events: &SyncSender<RuntimeEvent>, event: RuntimeEvent) {
 struct ActivePeer {
     session_id: u128,
     outbound: tokio_mpsc::Sender<Session>,
+    clipboard: Option<ActiveClipboard>,
+}
+
+struct ActiveClipboard {
+    session: ClipboardSession,
+    outbound: tokio_mpsc::Sender<ClipboardText>,
+}
+
+struct AgentClipboard {
+    session: ClipboardSession,
+    outbound: tokio_mpsc::Sender<ClipboardText>,
+}
+
+struct AgentNativeServices<'a> {
+    injection: &'a InjectionService,
+    clipboard: Option<&'a ClipboardService>,
+}
+
+struct ClipboardRuntimeState {
+    service: Option<ClipboardService>,
+    applications: ClipboardApplications,
+}
+
+impl ClipboardRuntimeState {
+    const fn new(service: Option<ClipboardService>) -> Self {
+        Self {
+            service,
+            applications: ClipboardApplications::new(),
+        }
+    }
+}
+
+struct ClipboardApplications {
+    pending: Option<(NodeId, ClipboardGeneration)>,
+    queued: VecDeque<(NodeId, ClipboardText)>,
+}
+
+impl ClipboardApplications {
+    const fn new() -> Self {
+        Self {
+            pending: None,
+            queued: VecDeque::new(),
+        }
+    }
 }
 
 struct PendingActivation {
@@ -1564,6 +2140,16 @@ enum NetworkEvent {
         message: Session,
     },
     Disconnected {
+        peer: NodeId,
+        session_id: u128,
+        reason: String,
+    },
+    ClipboardTransfer {
+        peer: NodeId,
+        session_id: u128,
+        transfer: ClipboardText,
+    },
+    ClipboardFailed {
         peer: NodeId,
         session_id: u128,
         reason: String,
@@ -1787,7 +2373,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             controller,
             &controller_trust,
-            session_profile(),
+            session_profile(true),
             SessionLimits::default(),
         )
         .unwrap_or_else(|error| panic!("server bind failed: {error}"));
@@ -1799,7 +2385,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             agent,
             &agent_trust,
-            session_profile(),
+            session_profile(true),
             SessionLimits::default(),
         )
         .unwrap_or_else(|error| panic!("client bind failed: {error}"));

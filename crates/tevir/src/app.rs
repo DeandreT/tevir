@@ -624,6 +624,16 @@ impl DesktopApp {
                 RuntimeEvent::ConfigurationApplied => {
                     self.notice = Some(Notice::success("Configuration applied"));
                 }
+                RuntimeEvent::ClipboardReady { .. } => {
+                    self.notice = Some(Notice::success("Clipboard synchronization ready"));
+                }
+                RuntimeEvent::ClipboardSynchronized { peer, received } => {
+                    self.notice = Some(Notice::info(if *received {
+                        format!("Clipboard received from {peer}")
+                    } else {
+                        format!("Clipboard sent to {peer}")
+                    }));
+                }
                 RuntimeEvent::Error { message } => {
                     self.notice = Some(Notice::error(message));
                 }
@@ -808,6 +818,20 @@ impl DesktopApp {
                 SUCCESS
             } else {
                 WARNING
+            },
+        );
+        metric_row(
+            ui,
+            "Text clipboard",
+            if self.session_state.clipboard_ready {
+                "Ready"
+            } else {
+                "Waiting"
+            },
+            if self.session_state.clipboard_ready {
+                SUCCESS
+            } else {
+                MUTED
             },
         );
         match self.session_state.role {
@@ -1932,6 +1956,7 @@ struct SessionState {
     focus: Option<NodeId>,
     agent_controlled: bool,
     native_ready: bool,
+    clipboard_ready: bool,
     last_error: Option<String>,
 }
 
@@ -1952,6 +1977,7 @@ impl SessionState {
                 self.focus = None;
                 self.agent_controlled = false;
                 self.native_ready = false;
+                self.clipboard_ready = false;
                 self.last_error = None;
             }
             RuntimeEvent::Listening { address } => {
@@ -1986,6 +2012,13 @@ impl SessionState {
                 tracing::info!(?backend, "native session backend ready");
                 self.native_ready = true;
             }
+            RuntimeEvent::ClipboardReady { backend } => {
+                tracing::info!(?backend, "native clipboard backend ready");
+                self.clipboard_ready = true;
+            }
+            RuntimeEvent::ClipboardSynchronized { peer, received } => {
+                tracing::info!(%peer, received, "clipboard synchronized");
+            }
             RuntimeEvent::FocusChanged { node } => {
                 self.focus = Some(node);
             }
@@ -2012,6 +2045,7 @@ impl SessionState {
                 self.displays.clear();
                 self.agent_controlled = false;
                 self.native_ready = false;
+                self.clipboard_ready = false;
                 self.phase = if self.last_error.is_some() {
                     SessionPhase::Failed
                 } else {
