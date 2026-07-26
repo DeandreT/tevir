@@ -423,6 +423,13 @@ impl DesktopApp {
                     {
                         self.notice = Some(Notice::info(format!("Controlling {node}")));
                     }
+                    RuntimeEvent::DisplayChanged { screen } => {
+                        self.config_editor.update_screen(screen);
+                        self.notice = Some(Notice::info(format!(
+                            "{} display updated to {} x {}",
+                            screen.node, screen.bounds.size.width, screen.bounds.size.height
+                        )));
+                    }
                     RuntimeEvent::Error { message } => {
                         self.notice = Some(Notice::error(message));
                     }
@@ -641,6 +648,14 @@ impl DesktopApp {
                 );
                 for peer in self.session_state.connected.keys() {
                     metric_row(ui, "Agent", peer.as_str(), SUCCESS);
+                    if let Some(size) = self.session_state.displays.get(peer) {
+                        metric_row(
+                            ui,
+                            &format!("{peer} display"),
+                            &format!("{} x {}", size.width, size.height),
+                            TEXT,
+                        );
+                    }
                 }
             }
             Some(RuntimeRole::Agent) => {
@@ -1600,6 +1615,7 @@ struct SessionState {
     phase: SessionPhase,
     role: Option<RuntimeRole>,
     connected: BTreeMap<NodeId, u128>,
+    displays: BTreeMap<NodeId, Size>,
     focus: Option<NodeId>,
     agent_controlled: bool,
     native_ready: bool,
@@ -1613,6 +1629,7 @@ impl SessionState {
                 self.phase = SessionPhase::Starting;
                 self.role = Some(role);
                 self.connected.clear();
+                self.displays.clear();
                 self.focus = None;
                 self.agent_controlled = false;
                 self.native_ready = false;
@@ -1637,6 +1654,7 @@ impl SessionState {
             }
             RuntimeEvent::Disconnected { peer, reason } => {
                 self.connected.remove(&peer);
+                self.displays.remove(&peer);
                 self.agent_controlled = false;
                 self.last_error = Some(format!("{peer}: {reason}"));
                 self.phase = match self.role {
@@ -1656,9 +1674,13 @@ impl SessionState {
                 tracing::info!(%controller, active, "agent control state changed");
                 self.agent_controlled = active;
             }
+            RuntimeEvent::DisplayChanged { screen } => {
+                self.displays.insert(screen.node, screen.bounds.size);
+            }
             RuntimeEvent::Error { message } => self.record_error(message),
             RuntimeEvent::Stopped => {
                 self.connected.clear();
+                self.displays.clear();
                 self.agent_controlled = false;
                 self.native_ready = false;
                 self.phase = if self.last_error.is_some() {
@@ -1899,6 +1921,23 @@ impl ConfigEditor {
     fn set_agent_monitor(&mut self, width: u32, height: u32) {
         self.agent_width = width.to_string();
         self.agent_height = height.to_string();
+    }
+
+    fn update_screen(&mut self, placement: &ScreenPlacement) {
+        let Some((index, screen)) = self
+            .screens
+            .iter_mut()
+            .enumerate()
+            .find(|(_, screen)| screen.node.trim() == placement.node.as_str())
+        else {
+            return;
+        };
+        screen.x = placement.bounds.origin.x.to_string();
+        screen.y = placement.bounds.origin.y.to_string();
+        screen.width = placement.bounds.size.width.to_string();
+        screen.height = placement.bounds.size.height.to_string();
+        self.selected_screen = index;
+        self.canvas_view = None;
     }
 
     fn move_screen(&mut self, index: usize, x: i32, y: i32) {
@@ -2369,7 +2408,9 @@ pub enum AppError {
 
 #[cfg(test)]
 mod tests {
-    use domain::NodeId;
+    use std::num::NonZeroU32;
+
+    use domain::{NodeId, Point, Rect, ScreenPlacement, Size};
     use identity::IdentityStore;
     use tempfile::TempDir;
 
@@ -2492,6 +2533,44 @@ mod tests {
                 y: 0,
                 width: 3_840,
                 height: 2_160,
+            })
+        );
+    }
+
+    #[test]
+    fn reported_display_updates_live_state_and_the_visual_editor() {
+        let local = NodeId::new("studio-left")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let remote = NodeId::new("studio-right")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let mut editor = ConfigEditor::for_node(Some(&local));
+        editor.add_screen(remote.to_string());
+        let screen = ScreenPlacement {
+            node: remote.clone(),
+            bounds: Rect::new(
+                Point { x: 1920, y: 0 },
+                Size::new(
+                    NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
+                    NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
+                ),
+            ),
+        };
+        let mut state = SessionState::default();
+
+        editor.update_screen(&screen);
+        state.apply(RuntimeEvent::DisplayChanged {
+            screen: screen.clone(),
+        });
+
+        assert_eq!(state.displays.get(&remote), Some(&screen.bounds.size));
+        assert_eq!(editor.selected_screen, 1);
+        assert_eq!(
+            editor.screens[1].geometry(),
+            Some(ScreenGeometry {
+                x: 1920,
+                y: 0,
+                width: 2560,
+                height: 1440,
             })
         );
     }

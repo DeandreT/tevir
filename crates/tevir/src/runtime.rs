@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use domain::{Edge, NodeId, ScreenPlacement, Topology};
+use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
     BackendKind, CaptureService, CaptureServiceEvent, InjectionService, InjectionServiceEvent,
@@ -113,6 +113,9 @@ pub enum RuntimeEvent {
         controller: NodeId,
         active: bool,
     },
+    DisplayChanged {
+        screen: ScreenPlacement,
+    },
     Error {
         message: String,
     },
@@ -215,7 +218,7 @@ fn run_worker(
 async fn run_controller(
     local_node: NodeId,
     listen: SocketAddr,
-    topology: Topology,
+    mut topology: Topology,
     identity: LocalIdentity,
     trust: TrustStore,
     mut commands: tokio_mpsc::Receiver<RuntimeCommand>,
@@ -292,6 +295,7 @@ async fn run_controller(
                 if let Some(network) = network {
                     handle_controller_network(
                         network,
+                        &mut topology,
                         &mut controller,
                         &capture,
                         &mut peers,
@@ -376,14 +380,6 @@ fn accept_controller_peer(
         .reset_peer(&info.peer)
         .map_err(|error| RuntimeError::Session(error.to_string()))?;
     let outbound = spawn_connection_worker(connection, network_tx.clone());
-    let initial_focus = Session::FocusChanged {
-        focus_epoch: controller.focus_epoch(),
-        target: controller.focus().clone(),
-        entry_position: controller.focus_position(),
-    };
-    outbound
-        .try_send(initial_focus)
-        .map_err(|_| RuntimeError::OutboundQueue(info.peer.clone()))?;
     peers.insert(
         info.peer.clone(),
         ActivePeer {
@@ -510,6 +506,7 @@ fn apply_controller_actions(
 
 fn handle_controller_network(
     event: NetworkEvent,
+    topology: &mut Topology,
     controller: &mut ControllerSession,
     capture: &CaptureService,
     peers: &mut BTreeMap<NodeId, ActivePeer>,
@@ -521,6 +518,56 @@ fn handle_controller_network(
             session_id,
             message,
         } if active_session(peers, &peer, session_id) => match message {
+            Session::DisplayChanged { size } => {
+                let updated = match resize_topology_screen(topology, &peer, size) {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        tracing::warn!(%peer, %error, "agent display update rejected");
+                        send_event(
+                            events,
+                            RuntimeEvent::Error {
+                                message: format!(
+                                    "Could not apply the display reported by `{peer}`: {error}"
+                                ),
+                            },
+                        );
+                        return Ok(());
+                    }
+                };
+                let screen = updated
+                    .screen(&peer)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::Session(format!("unknown peer `{peer}`")))?;
+                if updated != *topology {
+                    let actions = controller
+                        .reconcile_topology(updated.clone())
+                        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                    apply_controller_actions(actions, capture, peers, events)?;
+                    *topology = updated;
+                    send_event(
+                        events,
+                        RuntimeEvent::FocusChanged {
+                            node: controller.focus().clone(),
+                        },
+                    );
+                } else if let Some(connection) = peers.get(&peer) {
+                    connection
+                        .outbound
+                        .try_send(Session::FocusChanged {
+                            focus_epoch: controller.focus_epoch(),
+                            target: controller.focus().clone(),
+                            entry_position: controller.focus_position(),
+                        })
+                        .map_err(|_| RuntimeError::OutboundQueue(peer.clone()))?;
+                }
+                tracing::info!(
+                    peer = %peer,
+                    width = size.width.get(),
+                    height = size.height.get(),
+                    "agent display synchronized"
+                );
+                send_event(events, RuntimeEvent::DisplayChanged { screen });
+            }
             Session::InputAcknowledged { through_sequence } => {
                 controller
                     .acknowledge(&peer, through_sequence)
@@ -739,6 +786,15 @@ async fn run_agent_connection(
     let mut application_pending = false;
 
     let outcome = async {
+        sender
+            .send(Session::DisplayChanged { size: display_size })
+            .await
+            .map_err(|error| RuntimeError::Transport(error.to_string()))?;
+        tracing::info!(
+            width = display_size.width.get(),
+            height = display_size.height.get(),
+            "agent display reported"
+        );
         'session: loop {
             tokio::select! {
             command = commands.recv() => {
@@ -930,6 +986,66 @@ fn capture_edges(topology: &Topology, local_node: &NodeId) -> Vec<Edge> {
         .collect()
 }
 
+fn resize_topology_screen(
+    topology: &Topology,
+    node: &NodeId,
+    size: Size,
+) -> Result<Topology, String> {
+    let current = topology
+        .screen(node)
+        .ok_or_else(|| format!("node `{node}` is not present in the topology"))?;
+    if current.bounds.size == size {
+        return Ok(topology.clone());
+    }
+
+    let mut origin = current.bounds.origin;
+    for neighbor in topology
+        .screens()
+        .iter()
+        .filter(|screen| &screen.node != node)
+    {
+        let vertical_overlap = current.bounds.top() < neighbor.bounds.bottom()
+            && current.bounds.bottom() > neighbor.bounds.top();
+        if current.bounds.right() == neighbor.bounds.left() && vertical_overlap {
+            origin.x = i32::try_from(neighbor.bounds.left() - i64::from(size.width.get()))
+                .map_err(|_| format!("new width for `{node}` exceeds the coordinate range"))?;
+            break;
+        }
+    }
+    for neighbor in topology
+        .screens()
+        .iter()
+        .filter(|screen| &screen.node != node)
+    {
+        let horizontal_overlap = current.bounds.left() < neighbor.bounds.right()
+            && current.bounds.right() > neighbor.bounds.left();
+        if current.bounds.bottom() == neighbor.bounds.top() && horizontal_overlap {
+            origin.y = i32::try_from(neighbor.bounds.top() - i64::from(size.height.get()))
+                .map_err(|_| format!("new height for `{node}` exceeds the coordinate range"))?;
+            break;
+        }
+    }
+
+    let screens = topology
+        .screens()
+        .iter()
+        .cloned()
+        .map(|mut screen| {
+            if &screen.node == node {
+                screen.bounds = Rect::new(
+                    Point {
+                        x: origin.x,
+                        y: origin.y,
+                    },
+                    size,
+                );
+            }
+            screen
+        })
+        .collect();
+    Topology::new(screens).map_err(|error| error.to_string())
+}
+
 fn activation_target(
     topology: &Topology,
     local_node: &NodeId,
@@ -1069,8 +1185,8 @@ mod tests {
     use transport::{SecureClient, SecureServer, SessionLimits};
 
     use super::{
-        NETWORK_EVENT_CAPACITY, NetworkEvent, activation_target, capture_edges, session_profile,
-        spawn_accept_worker, spawn_connection_worker,
+        NETWORK_EVENT_CAPACITY, NetworkEvent, activation_target, capture_edges,
+        resize_topology_screen, session_profile, spawn_accept_worker, spawn_connection_worker,
     };
 
     fn node(value: &str) -> NodeId {
@@ -1120,6 +1236,54 @@ mod tests {
         assert_eq!(
             activation_target(&topology, &node("local"), Edge::Right),
             Some((node("right"), 639))
+        );
+    }
+
+    #[test]
+    fn reported_display_size_preserves_a_right_hand_attachment() {
+        let topology = Topology::new(vec![
+            screen("local", 0, 0, 1920, 1080),
+            screen("right", 1920, 0, 1920, 1080),
+        ])
+        .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
+
+        let updated = resize_topology_screen(
+            &topology,
+            &node("right"),
+            Size::new(
+                NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("display update should be valid: {error}"));
+
+        assert_eq!(
+            updated.screen(&node("right")),
+            Some(&screen("right", 1920, 0, 2560, 1440))
+        );
+    }
+
+    #[test]
+    fn reported_display_size_preserves_a_left_hand_attachment() {
+        let topology = Topology::new(vec![
+            screen("left", -1920, 0, 1920, 1080),
+            screen("local", 0, 0, 1920, 1080),
+        ])
+        .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
+
+        let updated = resize_topology_screen(
+            &topology,
+            &node("left"),
+            Size::new(
+                NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("display update should be valid: {error}"));
+
+        assert_eq!(
+            updated.screen(&node("left")),
+            Some(&screen("left", -2560, 0, 2560, 1440))
         );
     }
 

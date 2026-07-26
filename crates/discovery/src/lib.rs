@@ -572,7 +572,7 @@ mod tests {
         let bundle = bundle("studio-left");
         let mut properties = vec![
             ("node", "studio-left".to_owned()),
-            ("protocol", "1.1".to_owned()),
+            ("protocol", "1.2".to_owned()),
             ("platform", "linux-wayland".to_owned()),
             ("capabilities", "3".to_owned()),
             (

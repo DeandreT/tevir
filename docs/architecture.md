@@ -104,6 +104,11 @@ lower-priority streams. Stream counts, flow-control windows, handshakes,
 frames, operation deadlines, idle timeouts, and reconnect attempts are all
 bounded.
 
+After authentication, an agent reports its configured display dimensions
+before accepting focus or input. The controller reconciles those dimensions
+with the configured screen attachment, publishes the live placement to the
+desktop UI, and sends the resulting focus state to the agent.
+
 ## Clipboard
 
 Clipboard synchronization begins with bounded UTF-8 text. Each local change

@@ -44,6 +44,7 @@ impl AgentSession {
         }
 
         match message {
+            Session::DisplayChanged { .. } => Err(AgentError::UnexpectedDisplayChange),
             Session::FocusChanged {
                 focus_epoch,
                 target,
@@ -270,6 +271,8 @@ pub enum AgentError {
     AppliedSequenceMismatch { expected: u64, received: u64 },
     #[error("an input acknowledgement is not valid on an agent session")]
     UnexpectedAcknowledgement,
+    #[error("a display change is not valid from a controller")]
+    UnexpectedDisplayChange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

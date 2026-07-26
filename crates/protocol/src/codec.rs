@@ -110,12 +110,12 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
 
     use bytes::{BufMut, BytesMut};
-    use domain::NodeId;
+    use domain::{NodeId, Size};
 
     use super::{CodecError, FrameCodec};
     use crate::{
         CURRENT_PROTOCOL, Capabilities, DEFAULT_MAX_FRAME_BYTES, Envelope, Handshake, Hello,
-        HostPlatform,
+        HostPlatform, Session,
     };
 
     fn hello() -> Envelope {
@@ -150,6 +150,28 @@ mod tests {
             .unwrap_or_else(|error| panic!("decoding failed: {error}"));
 
         assert_eq!(decoded, Some(hello()));
+        assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn round_trips_a_display_change() {
+        let message = Envelope::Session(Session::DisplayChanged {
+            size: Size::new(
+                NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
+            ),
+        });
+        let codec = FrameCodec::default();
+        let mut frame = codec
+            .encode(&message)
+            .unwrap_or_else(|error| panic!("encoding failed: {error}"));
+
+        assert_eq!(
+            codec
+                .decode(&mut frame)
+                .unwrap_or_else(|error| panic!("decoding failed: {error}")),
+            Some(message)
+        );
         assert!(frame.is_empty());
     }
 
