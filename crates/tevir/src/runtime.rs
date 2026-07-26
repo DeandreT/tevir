@@ -158,6 +158,14 @@ impl NativeInputHost {
             Self::Agent(injection) => injection.is_finished(),
         }
     }
+
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match self {
+            Self::Controller(capture) => capture.is_ready(),
+            Self::Agent(injection) => injection.is_ready(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

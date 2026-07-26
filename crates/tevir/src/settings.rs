@@ -11,10 +11,13 @@ use thiserror::Error;
 const SETTINGS_FILE: &str = "desktop.toml";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct DesktopSettings {
     pub node: Option<NodeId>,
     pub config_path: Option<PathBuf>,
+    pub autostart: bool,
+    pub start_minimized: bool,
+    pub keep_running_in_tray: bool,
 }
 
 impl DesktopSettings {
@@ -89,6 +92,9 @@ mod tests {
                     .unwrap_or_else(|error| panic!("test node should be valid: {error}")),
             ),
             config_path: Some(directory.path().join("tevir.toml")),
+            autostart: true,
+            start_minimized: true,
+            keep_running_in_tray: true,
         };
         expected
             .save(directory.path())
@@ -97,5 +103,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("settings load failed: {error}"));
 
         assert_eq!(loaded.node, expected.node);
+        assert!(loaded.autostart);
+        assert!(loaded.start_minimized);
+        assert!(loaded.keep_running_in_tray);
     }
 }

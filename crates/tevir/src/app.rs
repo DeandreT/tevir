@@ -13,6 +13,7 @@ use domain::{
 use eframe::egui::{
     self, Align, Button, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Layout,
     Margin, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportBuilder,
+    ViewportCommand,
 };
 use identity::{IdentityStore, LocalIdentity, PairingBundle, TrustStore};
 use platform::{EnvironmentStatus, PlatformReport};
@@ -21,6 +22,7 @@ use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
     config::{Config, EdgeBehavior, Role},
+    desktop::{DesktopIntegration, TrayAction, set_autostart},
     runtime::{NativeInputHost, RuntimeEvent, RuntimeRole, SessionRuntime},
     settings::{DesktopSettings, SettingsError},
 };
@@ -82,6 +84,9 @@ pub struct DesktopApp {
     confirm_remove: Option<NodeId>,
     logs: LogBuffer,
     local_desktop: Option<platform::DesktopGeometry>,
+    desktop_integration: Option<DesktopIntegration>,
+    allow_window_close: bool,
+    show_window_on_first_frame: bool,
 }
 
 impl DesktopApp {
@@ -151,6 +156,9 @@ impl DesktopApp {
             confirm_remove: None,
             logs,
             local_desktop: None,
+            desktop_integration: None,
+            allow_window_close: false,
+            show_window_on_first_frame: false,
         };
         app.start_discovery();
         if load_saved_config && app.identity.is_some() {
@@ -522,6 +530,96 @@ impl DesktopApp {
         self.session_state.stop();
     }
 
+    fn return_control(&mut self) {
+        let Some(runtime) = self.session_runtime.as_ref() else {
+            return;
+        };
+        match runtime.return_control() {
+            Ok(()) => {
+                self.notice = Some(Notice::info("Returning control"));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn initialize_desktop_integration(&mut self) {
+        match DesktopIntegration::start() {
+            Ok(integration) => {
+                self.desktop_integration = Some(integration);
+                tracing::info!("system tray integration ready");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "system tray integration unavailable");
+                if self.settings.start_minimized {
+                    self.show_window_on_first_frame = true;
+                }
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn poll_desktop_integration(&mut self, context: &egui::Context) {
+        if self.show_window_on_first_frame {
+            context.send_viewport_cmd(ViewportCommand::Visible(true));
+            self.show_window_on_first_frame = false;
+        }
+
+        let actions = self
+            .desktop_integration
+            .as_ref()
+            .map_or_else(Vec::new, |integration| {
+                integration.set_return_control_enabled(self.session_state.is_controlling_remote());
+                integration.poll()
+            });
+        for action in actions {
+            match action {
+                TrayAction::Show => {
+                    context.send_viewport_cmd(ViewportCommand::Visible(true));
+                    context.send_viewport_cmd(ViewportCommand::Minimized(false));
+                    context.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                TrayAction::ReturnControl => self.return_control(),
+                TrayAction::Quit => {
+                    self.allow_window_close = true;
+                    context.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        if context.input(|input| input.viewport().close_requested())
+            && !self.allow_window_close
+            && self.settings.keep_running_in_tray
+            && self.desktop_integration.is_some()
+        {
+            context.send_viewport_cmd(ViewportCommand::CancelClose);
+            context.send_viewport_cmd(ViewportCommand::Visible(false));
+            tracing::info!("application window hidden to the system tray");
+        }
+    }
+
+    fn update_autostart(&mut self, enabled: bool) {
+        match set_autostart(enabled) {
+            Ok(()) => {
+                self.settings.autostart = enabled;
+                self.save_desktop_settings();
+                tracing::info!(enabled, "desktop autostart updated");
+            }
+            Err(error) => {
+                tracing::error!(enabled, %error, "desktop autostart update failed");
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn save_desktop_settings(&mut self) {
+        if let Err(error) = self.settings.save(&self.data_directory) {
+            tracing::error!(%error, "desktop settings save failed");
+            self.notice = Some(Notice::error(error.to_string()));
+        }
+    }
+
     fn prepare_native_input(&mut self, role: RuntimeRole) -> Result<NativeInputHost, String> {
         if let Some(native_input) = self
             .native_input
@@ -797,16 +895,8 @@ impl DesktopApp {
                             Button::new("Return control").min_size(Vec2::new(112.0, 34.0)),
                         )
                         .clicked()
-                        && let Some(runtime) = self.session_runtime.as_ref()
                     {
-                        match runtime.return_control() {
-                            Ok(()) => {
-                                self.notice = Some(Notice::info("Returning control"));
-                            }
-                            Err(error) => {
-                                self.notice = Some(Notice::error(error.to_string()));
-                            }
-                        }
+                        self.return_control();
                     }
                 } else if ui
                     .add_enabled(
@@ -823,20 +913,8 @@ impl DesktopApp {
         ui.add_space(14.0);
         let (state_label, state_color) = self.session_state.status();
         metric_row(ui, "State", state_label, state_color);
-        metric_row(
-            ui,
-            "Native input",
-            if self.session_state.native_ready {
-                "Ready"
-            } else {
-                "Waiting"
-            },
-            if self.session_state.native_ready {
-                SUCCESS
-            } else {
-                WARNING
-            },
-        );
+        let (native_label, native_color) = self.native_input_status();
+        metric_row(ui, "Native permission", native_label, native_color);
         metric_row(
             ui,
             "Text clipboard",
@@ -950,7 +1028,7 @@ impl DesktopApp {
         let platform_ready = self.report.is_available();
         metric_row(
             ui,
-            "Desktop input",
+            "Desktop environment",
             if platform_ready {
                 "Available"
             } else {
@@ -1060,6 +1138,46 @@ impl DesktopApp {
         match self.config_editor.role {
             ConfigRole::Controller => self.controller_configuration(ui),
             ConfigRole::Agent => self.agent_configuration(ui),
+        }
+
+        ui.add_space(30.0);
+        self.application_configuration(ui);
+    }
+
+    fn application_configuration(&mut self, ui: &mut Ui) {
+        section_heading(ui, "Application", "Startup and background behavior");
+        ui.add_space(10.0);
+
+        let mut autostart = self.settings.autostart;
+        if ui
+            .checkbox(&mut autostart, "Start automatically after sign-in")
+            .changed()
+        {
+            self.update_autostart(autostart);
+        }
+
+        let tray_available = self.desktop_integration.is_some();
+        ui.add_enabled_ui(tray_available, |ui| {
+            let mut start_minimized = self.settings.start_minimized;
+            if ui
+                .checkbox(&mut start_minimized, "Start with the window hidden")
+                .changed()
+            {
+                self.settings.start_minimized = start_minimized;
+                self.save_desktop_settings();
+            }
+
+            let mut keep_running = self.settings.keep_running_in_tray;
+            if ui
+                .checkbox(&mut keep_running, "Keep running when the window closes")
+                .changed()
+            {
+                self.settings.keep_running_in_tray = keep_running;
+                self.save_desktop_settings();
+            }
+        });
+        if !tray_available {
+            status_label(ui, "System tray unavailable", DANGER);
         }
     }
 
@@ -1601,6 +1719,8 @@ impl DesktopApp {
                 DANGER
             },
         );
+        let (native_label, native_color) = self.native_input_status();
+        metric_row(ui, "Native permission", native_label, native_color);
         ui.add_space(24.0);
         section_heading(
             ui,
@@ -1648,6 +1768,18 @@ impl DesktopApp {
     fn peer_count(&self) -> usize {
         self.trust.as_ref().map_or(0, |trust| trust.peers().len())
     }
+
+    fn native_input_status(&self) -> (&'static str, Color32) {
+        if !self.report.is_available() {
+            return ("Unavailable", DANGER);
+        }
+        match self.native_input.as_ref() {
+            Some(native_input) if native_input.is_ready() => ("Granted", SUCCESS),
+            Some(native_input) if native_input.is_finished() => ("Closed", DANGER),
+            Some(_) => ("Requesting", WARNING),
+            None => ("Not started", WARNING),
+        }
+    }
 }
 
 impl eframe::App for DesktopApp {
@@ -1657,6 +1789,7 @@ impl eframe::App for DesktopApp {
         self.poll_discovery();
         self.poll_session();
         self.poll_native_input();
+        self.poll_desktop_integration(ui.ctx());
         if self.identity.is_none() {
             self.setup_view(ui);
             return;
@@ -1683,12 +1816,14 @@ pub fn run(data_directory: PathBuf, node: Option<NodeId>, logs: LogBuffer) -> Re
         tracing::warn!(%error, "native input startup failed");
         app.notice = Some(Notice::error(error));
     }
+    let start_minimized = app.settings.start_minimized;
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Tevir")
             .with_app_id("tevir")
             .with_inner_size([1080.0, 760.0])
-            .with_min_inner_size([760.0, 520.0]),
+            .with_min_inner_size([760.0, 520.0])
+            .with_visible(!start_minimized),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -1697,6 +1832,7 @@ pub fn run(data_directory: PathBuf, node: Option<NodeId>, logs: LogBuffer) -> Re
         options,
         Box::new(move |creation| {
             configure_style(&creation.egui_ctx);
+            app.initialize_desktop_integration();
             Ok(Box::new(app))
         }),
     )
