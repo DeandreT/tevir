@@ -9,9 +9,6 @@
 - A **focus epoch** identifies one focus ownership interval. Events from an old
   epoch must never be injected after focus changes.
 
-These terms are project-owned and independent of legacy application naming and
-behavior.
-
 ## Dependency Direction
 
 ```text
@@ -74,11 +71,12 @@ for that lifetime and only arms the edges present in the active topology.
 
 ## Platform Boundaries
 
-Linux support is Wayland-only. Capture and injection use desktop portals and
-EIS instead of compositor-specific protocols, privileged `/dev/input` access,
-or X11 compatibility. Clipboard access uses the XDG Clipboard portal attached
-to a RemoteDesktop session. Portal reads and writes have fixed deadlines and
-accept only bounded UTF-8 `text/plain` selections.
+Linux support is Wayland-only. The platform crate directly implements capture
+and injection over desktop portals and EIS instead of compositor-specific
+protocols, privileged `/dev/input` access, or X11 compatibility. Clipboard
+access uses the XDG Clipboard portal attached to a RemoteDesktop session.
+Portal reads and writes have fixed deadlines and accept only bounded UTF-8
+`text/plain` selections.
 
 Windows capture and injection use low-level hooks on a dedicated message-loop
 thread and `SendInput`. Clipboard access uses the native Windows clipboard and
@@ -93,8 +91,7 @@ ceiling; the default is 1 MiB. Input batches are non-empty and contain at most
 512 events.
 
 Protocol versions match exactly. Version mismatch is a handshake result, not a
-request to enter a legacy mode. The protocol does not reuse legacy messages or
-configuration.
+request to enter a compatibility mode.
 
 Framing is not security. Each installation has a persistent private credential
 and exports only its trust anchor in a pairing bundle. Pairing requires an
@@ -108,12 +105,14 @@ lower-priority streams. Stream counts, flow-control windows, handshakes,
 frames, operation deadlines, idle timeouts, and reconnect attempts are all
 bounded.
 
-At desktop startup, an agent adopts the current monitor dimensions when the
-window system provides them, falling back to its configured dimensions. After
-authentication, it reports the effective size before accepting focus or input.
-The controller reconciles that size with the configured screen attachment,
-publishes the live placement to the desktop UI, and sends the resulting focus
-state to the agent.
+At desktop startup, a node enumerates every monitor exposed by the window
+system and adopts their aggregate physical-pixel desktop bounds, falling back
+to its configured dimensions. After authentication, an agent reports the
+effective size and monitor count before accepting focus or input. Native
+display changes invalidate active focus, release held input, and produce
+another report. The controller reconciles that size with the configured grid
+slot, publishes the live placement to the desktop UI, and sends the resulting
+focus state to the agent.
 
 ## Clipboard
 
@@ -142,11 +141,13 @@ reinjection; gaps and stale epochs are rejected. Focus changes, display changes,
 and broken connections release held state before another epoch can inject
 input.
 
-Topology rectangles use controller-global coordinates. An edge transition
-converts the entry point to destination-local coordinates before it enters a
-protocol message. The controller retains subpixel pointer motion, supports
-negative global coordinates, and only crosses between rectangles that share an
-edge.
+Topology uses a fixed 5x5 grid of machines. Each occupied slot represents one
+node's aggregate desktop, regardless of its local monitor arrangement. Focus
+can cross only into an occupied neighboring slot. An edge transition normalizes
+the activation position along the source edge, maps it proportionally onto the
+destination edge, and sends the destination-local absolute entry position
+before relative motion resumes. The controller retains subpixel pointer motion
+inside each desktop.
 
 The controller keeps one input batch in flight per agent and coalesces newer
 pointer motion until native application is acknowledged. Key and button

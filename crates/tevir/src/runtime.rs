@@ -1,15 +1,17 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroU32,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+use domain::{Edge, NodeId, ScreenPlacement, Size, Topology};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
-    BackendKind, CaptureService, CaptureServiceEvent, InjectionService, InjectionServiceEvent,
+    BackendKind, CaptureService, CaptureServiceEvent, DesktopGeometry, InjectionService,
+    InjectionServiceEvent,
 };
 use protocol::{Capabilities, Session};
 use session::{AgentAction, AgentSession, ControllerAction, ControllerSession};
@@ -161,8 +163,12 @@ pub enum RuntimeEvent {
         controller: NodeId,
         active: bool,
     },
+    LocalDesktopChanged {
+        geometry: DesktopGeometry,
+    },
     DisplayChanged {
         screen: ScreenPlacement,
+        monitor_count: u32,
     },
     Error {
         message: String,
@@ -379,7 +385,7 @@ async fn run_controller(
             _ = input_tick.tick() => {
                 drain_capture_events(
                     &capture,
-                    &topology,
+                    &mut topology,
                     &local_node,
                     &mut controller,
                     &peers,
@@ -473,7 +479,7 @@ fn accept_controller_peer(
 
 fn drain_capture_events(
     capture: &CaptureService,
-    topology: &Topology,
+    topology: &mut Topology,
     local_node: &NodeId,
     controller: &mut ControllerSession,
     peers: &BTreeMap<NodeId, ActivePeer>,
@@ -484,8 +490,13 @@ fn drain_capture_events(
             CaptureServiceEvent::Ready { backend } => {
                 send_event(events, RuntimeEvent::NativeReady { backend });
             }
-            CaptureServiceEvent::Activated { edge } => {
-                let Some((target, offset)) = activation_target(topology, local_node, edge) else {
+            CaptureServiceEvent::Activated {
+                edge,
+                edge_position,
+            } => {
+                let Some((target, offset)) =
+                    activation_target(topology, local_node, edge, edge_position)
+                else {
                     capture
                         .release()
                         .map_err(|error| RuntimeError::Native(error.to_string()))?;
@@ -513,6 +524,24 @@ fn drain_capture_events(
                         node: controller.focus().clone(),
                     },
                 );
+            }
+            CaptureServiceEvent::DesktopChanged(geometry) => {
+                let updated = resize_topology_screen(topology, local_node, geometry.size)
+                    .map_err(RuntimeError::Session)?;
+                if updated != *topology {
+                    let actions = controller
+                        .reconcile_topology(updated.clone())
+                        .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                    apply_controller_actions(actions, capture, peers, events)?;
+                    *topology = updated;
+                    send_event(
+                        events,
+                        RuntimeEvent::FocusChanged {
+                            node: controller.focus().clone(),
+                        },
+                    );
+                }
+                send_event(events, RuntimeEvent::LocalDesktopChanged { geometry });
             }
             CaptureServiceEvent::Input(event) => {
                 if controller.focus() == local_node {
@@ -591,7 +620,10 @@ fn handle_controller_network(
             session_id,
             message,
         } if active_session(peers, &peer, session_id) => match message {
-            Session::DisplayChanged { size } => {
+            Session::DisplayChanged {
+                size,
+                monitor_count,
+            } => {
                 let updated = match resize_topology_screen(topology, &peer, size) {
                     Ok(updated) => updated,
                     Err(error) => {
@@ -639,7 +671,13 @@ fn handle_controller_network(
                     height = size.height.get(),
                     "agent display synchronized"
                 );
-                send_event(events, RuntimeEvent::DisplayChanged { screen });
+                send_event(
+                    events,
+                    RuntimeEvent::DisplayChanged {
+                        screen,
+                        monitor_count: monitor_count.get(),
+                    },
+                );
             }
             Session::InputAcknowledged { through_sequence } => {
                 controller
@@ -768,6 +806,11 @@ async fn run_agent(
     }
     let reconnect = ReconnectPolicy::default();
     let mut attempt = 0u32;
+    let mut display_geometry = DesktopGeometry {
+        origin: domain::Point { x: 0, y: 0 },
+        size: display_size,
+        monitor_count: 1,
+    };
 
     loop {
         send_event(
@@ -801,7 +844,7 @@ async fn run_agent(
                 let outcome = run_agent_connection(
                     &local_node,
                     &controller_node,
-                    display_size,
+                    &mut display_geometry,
                     &injection,
                     connection,
                     &mut commands,
@@ -850,18 +893,37 @@ async fn run_agent(
 async fn run_agent_connection(
     local_node: &NodeId,
     controller_node: &NodeId,
-    display_size: domain::Size,
+    display_geometry: &mut DesktopGeometry,
     injection: &InjectionService,
     connection: PeerConnection,
     commands: &mut tokio_mpsc::Receiver<RuntimeCommand>,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<AgentConnectionOutcome, RuntimeError> {
+    while let Ok(event) = injection.try_recv() {
+        match event {
+            InjectionServiceEvent::Ready { backend } => {
+                send_event(events, RuntimeEvent::NativeReady { backend });
+            }
+            InjectionServiceEvent::DesktopChanged(geometry) => {
+                *display_geometry = geometry;
+            }
+            InjectionServiceEvent::Failed { operation, reason } => {
+                return Err(RuntimeError::Native(format!("{operation}: {reason}")));
+            }
+            InjectionServiceEvent::Stopped => {
+                return Err(RuntimeError::Native(String::from(
+                    "Input injection service stopped",
+                )));
+            }
+            InjectionServiceEvent::Applied { .. } | InjectionServiceEvent::Released { .. } => {}
+        }
+    }
     let injection_generation = injection
         .begin_session()
         .map_err(|error| RuntimeError::Native(error.to_string()))?;
     let (mut sender, receiver) = connection.split_control();
     let (mut inbound, reader_worker) = spawn_control_reader(receiver);
-    let mut agent = AgentSession::new(local_node.clone(), display_size);
+    let mut agent = AgentSession::new(local_node.clone(), display_geometry.size);
     let mut input_tick = tokio::time::interval(INPUT_POLL_INTERVAL);
     input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut controlled = false;
@@ -869,13 +931,24 @@ async fn run_agent_connection(
 
     let outcome = async {
         sender
-            .send(Session::DisplayChanged { size: display_size })
+            .send(Session::DisplayChanged {
+                size: display_geometry.size,
+                monitor_count: NonZeroU32::new(display_geometry.monitor_count)
+                    .unwrap_or(NonZeroU32::MIN),
+            })
             .await
             .map_err(|error| RuntimeError::Transport(error.to_string()))?;
         tracing::info!(
-            width = display_size.width.get(),
-            height = display_size.height.get(),
+            width = display_geometry.size.width.get(),
+            height = display_geometry.size.height.get(),
+            monitors = display_geometry.monitor_count,
             "agent display reported"
+        );
+        send_event(
+            events,
+            RuntimeEvent::LocalDesktopChanged {
+                geometry: *display_geometry,
+            },
         );
         'session: loop {
             tokio::select! {
@@ -926,6 +999,47 @@ async fn run_agent_connection(
                     match event {
                         InjectionServiceEvent::Ready { backend } => {
                             send_event(events, RuntimeEvent::NativeReady { backend });
+                        }
+                        InjectionServiceEvent::DesktopChanged(geometry) => {
+                            if geometry != *display_geometry {
+                                *display_geometry = geometry;
+                                application_pending = false;
+                                let actions = agent.reconcile_display(geometry.size);
+                                apply_agent_actions(
+                                    actions,
+                                    injection,
+                                    injection_generation,
+                                    &mut sender,
+                                )
+                                .await?;
+                                sender
+                                    .send(Session::DisplayChanged {
+                                        size: geometry.size,
+                                        monitor_count: NonZeroU32::new(geometry.monitor_count)
+                                            .unwrap_or(NonZeroU32::MIN),
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        RuntimeError::Transport(error.to_string())
+                                    })?;
+                                if controlled {
+                                    controlled = false;
+                                    send_event(events, RuntimeEvent::AgentControl {
+                                        controller: controller_node.clone(),
+                                        active: false,
+                                    });
+                                }
+                                send_event(
+                                    events,
+                                    RuntimeEvent::LocalDesktopChanged { geometry },
+                                );
+                                tracing::info!(
+                                    width = geometry.size.width.get(),
+                                    height = geometry.size.height.get(),
+                                    monitors = geometry.monitor_count,
+                                    "agent display change reported"
+                                );
+                            }
                         }
                         InjectionServiceEvent::Applied {
                             generation,
@@ -990,7 +1104,9 @@ async fn apply_agent_actions(
 ) -> Result<(), RuntimeError> {
     for action in actions {
         match action {
-            AgentAction::FocusEntered { .. } => {}
+            AgentAction::FocusEntered { position } => injection
+                .warp_cursor(injection_generation, position)
+                .map_err(|error| RuntimeError::Native(error.to_string()))?,
             AgentAction::ApplyInput(batch) => injection
                 .apply_batch(injection_generation, batch.sequence, batch.events)
                 .map_err(|error| RuntimeError::Native(error.to_string()))?,
@@ -1094,7 +1210,7 @@ fn spawn_control_reader(
 fn capture_edges(topology: &Topology, local_node: &NodeId) -> Vec<Edge> {
     [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
         .into_iter()
-        .filter(|edge| activation_target(topology, local_node, *edge).is_some())
+        .filter(|edge| activation_target(topology, local_node, *edge, None).is_some())
         .collect()
 }
 
@@ -1106,36 +1222,8 @@ fn resize_topology_screen(
     let current = topology
         .screen(node)
         .ok_or_else(|| format!("node `{node}` is not present in the topology"))?;
-    if current.bounds.size == size {
+    if current.size == size {
         return Ok(topology.clone());
-    }
-
-    let mut origin = current.bounds.origin;
-    for neighbor in topology
-        .screens()
-        .iter()
-        .filter(|screen| &screen.node != node)
-    {
-        let vertical_overlap = current.bounds.top() < neighbor.bounds.bottom()
-            && current.bounds.bottom() > neighbor.bounds.top();
-        if current.bounds.right() == neighbor.bounds.left() && vertical_overlap {
-            origin.x = i32::try_from(neighbor.bounds.left() - i64::from(size.width.get()))
-                .map_err(|_| format!("new width for `{node}` exceeds the coordinate range"))?;
-            break;
-        }
-    }
-    for neighbor in topology
-        .screens()
-        .iter()
-        .filter(|screen| &screen.node != node)
-    {
-        let horizontal_overlap = current.bounds.left() < neighbor.bounds.right()
-            && current.bounds.right() > neighbor.bounds.left();
-        if current.bounds.bottom() == neighbor.bounds.top() && horizontal_overlap {
-            origin.y = i32::try_from(neighbor.bounds.top() - i64::from(size.height.get()))
-                .map_err(|_| format!("new height for `{node}` exceeds the coordinate range"))?;
-            break;
-        }
     }
 
     let screens = topology
@@ -1144,13 +1232,7 @@ fn resize_topology_screen(
         .cloned()
         .map(|mut screen| {
             if &screen.node == node {
-                screen.bounds = Rect::new(
-                    Point {
-                        x: origin.x,
-                        y: origin.y,
-                    },
-                    size,
-                );
+                screen.size = size;
             }
             screen
         })
@@ -1162,54 +1244,26 @@ fn activation_target(
     topology: &Topology,
     local_node: &NodeId,
     edge: Edge,
+    edge_position: Option<f64>,
 ) -> Option<(NodeId, u32)> {
     let source = topology.screen(local_node)?;
-    topology.screens().iter().find_map(|candidate| {
-        if candidate.node == source.node {
-            return None;
-        }
-        shared_edge_offset(source, candidate, edge).map(|offset| (candidate.node.clone(), offset))
-    })
-}
-
-fn shared_edge_offset(
-    source: &ScreenPlacement,
-    candidate: &ScreenPlacement,
-    edge: Edge,
-) -> Option<u32> {
-    let (source_start, candidate_start, candidate_end) = match edge {
-        Edge::Left if candidate.bounds.right() == source.bounds.left() => (
-            source.bounds.top(),
-            candidate.bounds.top(),
-            candidate.bounds.bottom(),
-        ),
-        Edge::Right if candidate.bounds.left() == source.bounds.right() => (
-            source.bounds.top(),
-            candidate.bounds.top(),
-            candidate.bounds.bottom(),
-        ),
-        Edge::Top if candidate.bounds.bottom() == source.bounds.top() => (
-            source.bounds.left(),
-            candidate.bounds.left(),
-            candidate.bounds.right(),
-        ),
-        Edge::Bottom if candidate.bounds.top() == source.bounds.bottom() => (
-            source.bounds.left(),
-            candidate.bounds.left(),
-            candidate.bounds.right(),
-        ),
-        _ => return None,
-    };
-    let source_end = match edge {
-        Edge::Left | Edge::Right => source.bounds.bottom(),
-        Edge::Top | Edge::Bottom => source.bounds.right(),
-    };
-    let overlap_start = source_start.max(candidate_start);
-    let overlap_end = source_end.min(candidate_end);
-    if overlap_start >= overlap_end {
-        return None;
+    if let Some(edge_position) = edge_position {
+        let length = match edge {
+            Edge::Left | Edge::Right => source.size.height.get(),
+            Edge::Top | Edge::Bottom => source.size.width.get(),
+        };
+        let maximum = length.saturating_sub(1);
+        let offset = (edge_position.clamp(0.0, 1.0) * f64::from(maximum)).round() as u32;
+        let transition = topology.transition(local_node, edge, offset)?;
+        return Some((transition.target.clone(), offset));
     }
-    u32::try_from((overlap_start + overlap_end - 1) / 2 - source_start).ok()
+    let length = match edge {
+        Edge::Left | Edge::Right => source.size.height.get(),
+        Edge::Top | Edge::Bottom => source.size.width.get(),
+    };
+    let offset = length.saturating_sub(1) / 2;
+    let transition = topology.transition(local_node, edge, offset)?;
+    Some((transition.target.clone(), offset))
 }
 
 fn session_profile() -> SessionProfile {
@@ -1298,7 +1352,7 @@ mod tests {
         time::Duration,
     };
 
-    use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+    use domain::{Edge, GridSlot, NodeId, ScreenPlacement, Size, Topology};
     use identity::{IdentityStore, LocalIdentity, TrustStore};
     use protocol::Session;
     use tempfile::TempDir;
@@ -1314,15 +1368,13 @@ mod tests {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
     }
 
-    fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
+    fn screen(node_id: &str, column: u8, row: u8, width: u32, height: u32) -> ScreenPlacement {
         ScreenPlacement {
             node: node(node_id),
-            bounds: Rect::new(
-                Point { x, y },
-                Size::new(
-                    NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
-                    NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
-                ),
+            slot: GridSlot::new(column, row),
+            size: Size::new(
+                NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
             ),
         }
     }
@@ -1348,23 +1400,27 @@ mod tests {
     #[test]
     fn capture_edges_and_offsets_follow_the_local_topology() {
         let topology = Topology::new(vec![
-            screen("local", 0, 0, 1920, 1080),
-            screen("right", 1920, 200, 2560, 1440),
+            screen("local", 2, 2, 1920, 1080),
+            screen("right", 3, 2, 2560, 1440),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
         assert_eq!(capture_edges(&topology, &node("local")), vec![Edge::Right]);
         assert_eq!(
-            activation_target(&topology, &node("local"), Edge::Right),
-            Some((node("right"), 639))
+            activation_target(&topology, &node("local"), Edge::Right, None),
+            Some((node("right"), 539))
+        );
+        assert_eq!(
+            activation_target(&topology, &node("local"), Edge::Right, Some(0.05)),
+            Some((node("right"), 54))
         );
     }
 
     #[test]
     fn reported_display_size_preserves_a_right_hand_attachment() {
         let topology = Topology::new(vec![
-            screen("local", 0, 0, 1920, 1080),
-            screen("right", 1920, 0, 1920, 1080),
+            screen("local", 2, 2, 1920, 1080),
+            screen("right", 3, 2, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
@@ -1380,15 +1436,15 @@ mod tests {
 
         assert_eq!(
             updated.screen(&node("right")),
-            Some(&screen("right", 1920, 0, 2560, 1440))
+            Some(&screen("right", 3, 2, 2560, 1440))
         );
     }
 
     #[test]
     fn reported_display_size_preserves_a_left_hand_attachment() {
         let topology = Topology::new(vec![
-            screen("left", -1920, 0, 1920, 1080),
-            screen("local", 0, 0, 1920, 1080),
+            screen("left", 1, 2, 1920, 1080),
+            screen("local", 2, 2, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
@@ -1404,7 +1460,7 @@ mod tests {
 
         assert_eq!(
             updated.screen(&node("left")),
-            Some(&screen("left", -2560, 0, 2560, 1440))
+            Some(&screen("left", 1, 2, 2560, 1440))
         );
     }
 

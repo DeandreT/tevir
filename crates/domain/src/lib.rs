@@ -12,4 +12,7 @@ pub use identity::{NodeId, NodeIdError};
 pub use input::{
     ButtonAction, InputEvent, InputKind, KeyAction, MouseButton, PhysicalKey, ScrollDelta,
 };
-pub use topology::{Edge, ScreenPlacement, Topology, TopologyError, Transition};
+pub use topology::{
+    Edge, GridSlot, ScreenPlacement, TOPOLOGY_COLUMNS, TOPOLOGY_ROWS, Topology, TopologyError,
+    Transition,
+};

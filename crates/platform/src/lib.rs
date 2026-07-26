@@ -7,6 +7,7 @@ mod clipboard;
 mod convert;
 #[cfg(target_os = "linux")]
 mod linux_wayland;
+mod native_input;
 mod service;
 mod state;
 #[cfg(target_os = "windows")]
@@ -16,8 +17,8 @@ pub use clipboard::{ClipboardService, ClipboardServiceEvent};
 pub use domain::HostPlatform;
 use serde::Serialize;
 pub use service::{
-    BackendKind, CaptureService, CaptureServiceEvent, InjectionService, InjectionServiceEvent,
-    SERVICE_QUEUE_CAPACITY,
+    BackendKind, CaptureService, CaptureServiceEvent, DesktopGeometry, InjectionService,
+    InjectionServiceEvent, SERVICE_QUEUE_CAPACITY,
 };
 use thiserror::Error;
 
@@ -27,15 +28,11 @@ compile_error!("Tevir supports only Windows and Linux Wayland");
 #[cfg(target_os = "linux")]
 pub use linux_wayland::probe_host;
 #[cfg(target_os = "linux")]
-use linux_wayland::{
-    native_capture_backend, native_capture_kind, native_emulation_backend, native_emulation_kind,
-};
+use linux_wayland::{native_capture_kind, native_emulation_kind};
 #[cfg(target_os = "windows")]
 pub use windows::probe_host;
 #[cfg(target_os = "windows")]
-use windows::{
-    native_capture_backend, native_capture_kind, native_emulation_backend, native_emulation_kind,
-};
+use windows::{native_capture_kind, native_emulation_kind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

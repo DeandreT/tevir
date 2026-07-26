@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use domain::{NodeId, Point, Rect, ScreenPlacement, Size, Topology, TopologyError};
+use domain::{GridSlot, NodeId, ScreenPlacement, Size, Topology, TopologyError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -165,8 +165,8 @@ enum RoleFile {
 #[serde(deny_unknown_fields)]
 struct Screen {
     node: NodeId,
-    x: i32,
-    y: i32,
+    column: u8,
+    row: u8,
     width: NonZeroU32,
     height: NonZeroU32,
 }
@@ -175,23 +175,18 @@ impl Screen {
     fn into_placement(self) -> ScreenPlacement {
         ScreenPlacement {
             node: self.node,
-            bounds: Rect::new(
-                Point {
-                    x: self.x,
-                    y: self.y,
-                },
-                Size::new(self.width, self.height),
-            ),
+            slot: GridSlot::new(self.column, self.row),
+            size: Size::new(self.width, self.height),
         }
     }
 
     fn from_placement(placement: &ScreenPlacement) -> Self {
         Self {
             node: placement.node.clone(),
-            x: placement.bounds.origin.x,
-            y: placement.bounds.origin.y,
-            width: placement.bounds.size.width,
-            height: placement.bounds.size.height,
+            column: placement.slot.column,
+            row: placement.slot.row,
+            width: placement.size.width,
+            height: placement.size.height,
         }
     }
 }
@@ -247,15 +242,15 @@ mod tests {
 
                 [[role.screens]]
                 node = "left"
-                x = 0
-                y = 0
+                column = 1
+                row = 2
                 width = 1920
                 height = 1080
 
                 [[role.screens]]
                 node = "right"
-                x = 1920
-                y = 0
+                column = 2
+                row = 2
                 width = 2560
                 height = 1440
             "#,
@@ -282,8 +277,8 @@ mod tests {
 
                 [[role.screens]]
                 node = "right"
-                x = 0
-                y = 0
+                column = 2
+                row = 2
                 width = 1920
                 height = 1080
             "#,
@@ -357,8 +352,8 @@ mod tests {
 
                 [[role.screens]]
                 node = "left"
-                x = 0
-                y = 0
+                column = 2
+                row = 2
                 width = 1920
                 height = 1080
             "#,

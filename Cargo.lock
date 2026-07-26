@@ -976,6 +976,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
+name = "enigo"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71c6c56e50f7acae2906a0dcbb34529ca647e40421119ad5d12e7f8ba6e50010"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-graphics 0.25.0",
+ "foreign-types-shared",
+ "libc",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "windows",
+ "xkbcommon",
+ "xkeysym",
+]
+
+[[package]]
 name = "enumflags2"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1669,7 +1688,6 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52596e757f8f2ab20062402cd335c691886571fc86cffda98accf7ebe50f4d5c"
 dependencies = [
- "ashpd",
  "async-trait",
  "bitflags 2.13.1",
  "core-foundation 0.10.1",
@@ -1683,7 +1701,6 @@ dependencies = [
  "log",
  "memmap",
  "once_cell",
- "reis",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -1697,7 +1714,6 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a20d8398f550ead6da44e799216299c1488b93b514bb6c08cb0d409e91328449"
 dependencies = [
- "ashpd",
  "async-trait",
  "bitflags 2.13.1",
  "core-foundation 0.10.1",
@@ -1708,7 +1724,6 @@ dependencies = [
  "keycode",
  "log",
  "once_cell",
- "reis",
  "thiserror 2.0.19",
  "tokio",
  "windows",
@@ -2627,11 +2642,13 @@ dependencies = [
  "arboard",
  "ashpd",
  "domain",
+ "enigo",
  "futures-util",
  "input-capture",
  "input-emulation",
  "input-event",
  "keycode",
+ "reis",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -4687,6 +4704,17 @@ name = "xcursor"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
+
+[[package]]
+name = "xkbcommon"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
+dependencies = [
+ "libc",
+ "memmap2",
+ "xkeysym",
+]
 
 [[package]]
 name = "xkbcommon-dl"

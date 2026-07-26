@@ -3,12 +3,44 @@ use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{NodeId, Point, Rect};
+use crate::{NodeId, Point, Size};
+
+pub const TOPOLOGY_COLUMNS: u8 = 5;
+pub const TOPOLOGY_ROWS: u8 = 5;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct GridSlot {
+    pub column: u8,
+    pub row: u8,
+}
+
+impl GridSlot {
+    #[must_use]
+    pub const fn new(column: u8, row: u8) -> Self {
+        Self { column, row }
+    }
+
+    #[must_use]
+    pub const fn neighbor(self, edge: Edge) -> Option<Self> {
+        match edge {
+            Edge::Left if self.column > 0 => Some(Self::new(self.column - 1, self.row)),
+            Edge::Right if self.column + 1 < TOPOLOGY_COLUMNS => {
+                Some(Self::new(self.column + 1, self.row))
+            }
+            Edge::Top if self.row > 0 => Some(Self::new(self.column, self.row - 1)),
+            Edge::Bottom if self.row + 1 < TOPOLOGY_ROWS => {
+                Some(Self::new(self.column, self.row + 1))
+            }
+            Edge::Left | Edge::Right | Edge::Top | Edge::Bottom => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScreenPlacement {
     pub node: NodeId,
-    pub bounds: Rect,
+    pub slot: GridSlot,
+    pub size: Size,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -26,7 +58,7 @@ pub struct Transition<'a> {
     pub local_position: Point,
 }
 
-/// A connected, non-overlapping arrangement of node desktops.
+/// A connected arrangement of node desktops on the fixed topology grid.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Topology {
     screens: Vec<ScreenPlacement>,
@@ -39,27 +71,19 @@ impl Topology {
         }
 
         let mut nodes = HashSet::with_capacity(screens.len());
+        let mut slots = HashSet::with_capacity(screens.len());
         for screen in &screens {
             if !nodes.insert(screen.node.clone()) {
                 return Err(TopologyError::DuplicateNode(screen.node.clone()));
             }
-        }
-
-        for (index, first) in screens.iter().enumerate() {
-            if u64::from(first.bounds.size.width.get()) > i32::MAX as u64 + 1
-                || u64::from(first.bounds.size.height.get()) > i32::MAX as u64 + 1
-                || first.bounds.right() > i64::from(i32::MAX) + 1
-                || first.bounds.bottom() > i64::from(i32::MAX) + 1
-            {
-                return Err(TopologyError::CoordinateOverflow(first.node.clone()));
+            if screen.slot.column >= TOPOLOGY_COLUMNS || screen.slot.row >= TOPOLOGY_ROWS {
+                return Err(TopologyError::SlotOutOfBounds {
+                    node: screen.node.clone(),
+                    slot: screen.slot,
+                });
             }
-            for second in &screens[index + 1..] {
-                if first.bounds.overlaps(second.bounds) {
-                    return Err(TopologyError::OverlappingScreens {
-                        first: first.node.clone(),
-                        second: second.node.clone(),
-                    });
-                }
+            if !slots.insert(screen.slot) {
+                return Err(TopologyError::OccupiedSlot(screen.slot));
             }
         }
 
@@ -89,102 +113,62 @@ impl Topology {
     }
 
     #[must_use]
-    pub fn screen_at(&self, point: Point) -> Option<&ScreenPlacement> {
-        self.screens
-            .iter()
-            .find(|screen| screen.bounds.contains(point))
+    pub fn screen_in_slot(&self, slot: GridSlot) -> Option<&ScreenPlacement> {
+        self.screens.iter().find(|screen| screen.slot == slot)
     }
 
     /// Finds the desktop entered through `edge` at an offset on the current edge.
     #[must_use]
     pub fn transition(&self, current: &NodeId, edge: Edge, offset: u32) -> Option<Transition<'_>> {
-        let source = self.screens.iter().find(|screen| &screen.node == current)?;
-        let axis = match edge {
-            Edge::Left | Edge::Right => {
-                if offset >= source.bounds.size.height.get() {
-                    return None;
-                }
-                source.bounds.top() + i64::from(offset)
-            }
-            Edge::Top | Edge::Bottom => {
-                if offset >= source.bounds.size.width.get() {
-                    return None;
-                }
-                source.bounds.left() + i64::from(offset)
-            }
+        let source = self.screen(current)?;
+        let source_length = edge_length(source.size, edge);
+        if offset >= source_length {
+            return None;
+        }
+        let target_slot = source.slot.neighbor(edge)?;
+        let target = self.screen_in_slot(target_slot)?;
+        let mapped = map_edge_offset(offset, source_length, edge_length(target.size, edge));
+        let maximum_x = i32::try_from(target.size.width.get() - 1).ok()?;
+        let maximum_y = i32::try_from(target.size.height.get() - 1).ok()?;
+        let mapped = i32::try_from(mapped).ok()?;
+        let local_position = match edge {
+            Edge::Left => Point {
+                x: maximum_x,
+                y: mapped,
+            },
+            Edge::Right => Point { x: 0, y: mapped },
+            Edge::Top => Point {
+                x: mapped,
+                y: maximum_y,
+            },
+            Edge::Bottom => Point { x: mapped, y: 0 },
         };
-
-        self.screens.iter().find_map(|candidate| {
-            if candidate.node == source.node {
-                return None;
-            }
-
-            let position = match edge {
-                Edge::Left
-                    if candidate.bounds.right() == source.bounds.left()
-                        && contains_axis(
-                            candidate.bounds.top(),
-                            candidate.bounds.bottom(),
-                            axis,
-                        ) =>
-                {
-                    Point {
-                        x: i32::try_from(candidate.bounds.size.width.get() - 1).ok()?,
-                        y: i32::try_from(axis - candidate.bounds.top()).ok()?,
-                    }
-                }
-                Edge::Right
-                    if candidate.bounds.left() == source.bounds.right()
-                        && contains_axis(
-                            candidate.bounds.top(),
-                            candidate.bounds.bottom(),
-                            axis,
-                        ) =>
-                {
-                    Point {
-                        x: 0,
-                        y: i32::try_from(axis - candidate.bounds.top()).ok()?,
-                    }
-                }
-                Edge::Top
-                    if candidate.bounds.bottom() == source.bounds.top()
-                        && contains_axis(
-                            candidate.bounds.left(),
-                            candidate.bounds.right(),
-                            axis,
-                        ) =>
-                {
-                    Point {
-                        x: i32::try_from(axis - candidate.bounds.left()).ok()?,
-                        y: i32::try_from(candidate.bounds.size.height.get() - 1).ok()?,
-                    }
-                }
-                Edge::Bottom
-                    if candidate.bounds.top() == source.bounds.bottom()
-                        && contains_axis(
-                            candidate.bounds.left(),
-                            candidate.bounds.right(),
-                            axis,
-                        ) =>
-                {
-                    Point {
-                        x: i32::try_from(axis - candidate.bounds.left()).ok()?,
-                        y: 0,
-                    }
-                }
-                _ => return None,
-            };
-
-            Some(Transition {
-                target: &candidate.node,
-                local_position: position,
-            })
+        Some(Transition {
+            target: &target.node,
+            local_position,
         })
     }
 }
 
-fn contains_axis(start: i64, end: i64, value: i64) -> bool {
-    value >= start && value < end
+const fn edge_length(size: Size, edge: Edge) -> u32 {
+    match edge {
+        Edge::Left | Edge::Right => size.height.get(),
+        Edge::Top | Edge::Bottom => size.width.get(),
+    }
+}
+
+fn map_edge_offset(offset: u32, source_length: u32, target_length: u32) -> u32 {
+    let source_span = source_length.saturating_sub(1);
+    let target_span = target_length.saturating_sub(1);
+    if source_span == 0 {
+        return 0;
+    }
+    let numerator = u64::from(offset)
+        .saturating_mul(u64::from(target_span))
+        .saturating_add(u64::from(source_span / 2));
+    u32::try_from(numerator / u64::from(source_span))
+        .unwrap_or(u32::MAX)
+        .min(target_span)
 }
 
 fn connected_screen_indexes(screens: &[ScreenPlacement]) -> HashSet<usize> {
@@ -198,7 +182,7 @@ fn connected_screen_indexes(screens: &[ScreenPlacement]) -> HashSet<usize> {
 
         for (candidate_index, candidate) in screens.iter().enumerate() {
             if !connected.contains(&candidate_index)
-                && screens[index].bounds.shares_edge(candidate.bounds)
+                && slots_are_adjacent(screens[index].slot, candidate.slot)
             {
                 pending.push_back(candidate_index);
             }
@@ -208,17 +192,28 @@ fn connected_screen_indexes(screens: &[ScreenPlacement]) -> HashSet<usize> {
     connected
 }
 
+const fn slots_are_adjacent(first: GridSlot, second: GridSlot) -> bool {
+    (first.column == second.column && first.row.abs_diff(second.row) == 1)
+        || (first.row == second.row && first.column.abs_diff(second.column) == 1)
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TopologyError {
     #[error("topology must contain at least one screen")]
     Empty,
     #[error("node `{0}` appears more than once in the topology")]
     DuplicateNode(NodeId),
-    #[error("screens for `{first}` and `{second}` overlap")]
-    OverlappingScreens { first: NodeId, second: NodeId },
-    #[error("screen for `{0}` extends beyond the supported coordinate range")]
-    CoordinateOverflow(NodeId),
-    #[error("screen for `{0}` does not share an edge with the connected topology")]
+    #[error(
+        "screen for `{node}` uses grid slot ({}, {}), outside the {}x{} topology",
+        slot.column,
+        slot.row,
+        TOPOLOGY_COLUMNS,
+        TOPOLOGY_ROWS
+    )]
+    SlotOutOfBounds { node: NodeId, slot: GridSlot },
+    #[error("grid slot ({}, {}) contains more than one screen", .0.column, .0.row)]
+    OccupiedSlot(GridSlot),
+    #[error("screen for `{0}` is not adjacent to the connected topology")]
     DisconnectedNode(NodeId),
 }
 
@@ -226,94 +221,108 @@ pub enum TopologyError {
 mod tests {
     use std::num::NonZeroU32;
 
-    use super::{Edge, ScreenPlacement, Topology, TopologyError};
-    use crate::{NodeId, Point, Rect, Size};
+    use super::{Edge, GridSlot, ScreenPlacement, TOPOLOGY_COLUMNS, Topology, TopologyError};
+    use crate::{NodeId, Point, Size};
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
     }
 
-    fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
-        let width = NonZeroU32::new(width).unwrap_or_else(|| panic!("test width must be non-zero"));
-        let height =
-            NonZeroU32::new(height).unwrap_or_else(|| panic!("test height must be non-zero"));
+    fn screen(node_id: &str, column: u8, row: u8, width: u32, height: u32) -> ScreenPlacement {
         ScreenPlacement {
             node: node(node_id),
-            bounds: Rect::new(Point { x, y }, Size::new(width, height)),
+            slot: GridSlot::new(column, row),
+            size: Size::new(
+                NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+            ),
         }
     }
 
     #[test]
-    fn routes_across_a_shared_edge() {
+    fn maps_edge_positions_proportionally_between_desktops() {
         let topology = Topology::new(vec![
-            screen("left", 0, 0, 1920, 1080),
-            screen("right", 1920, 0, 2560, 1440),
+            screen("left", 1, 2, 1920, 1080),
+            screen("right", 2, 2, 2560, 1440),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
-        let transition = topology
+        let middle = topology
             .transition(&node("left"), Edge::Right, 540)
             .unwrap_or_else(|| panic!("expected an adjacent screen"));
+        let top = topology
+            .transition(&node("left"), Edge::Right, 0)
+            .unwrap_or_else(|| panic!("expected an adjacent screen"));
+        let bottom = topology
+            .transition(&node("left"), Edge::Right, 1079)
+            .unwrap_or_else(|| panic!("expected an adjacent screen"));
 
-        assert_eq!(transition.target, &node("right"));
-        assert_eq!(transition.local_position, Point { x: 0, y: 540 });
+        assert_eq!(middle.target, &node("right"));
+        assert_eq!(middle.local_position, Point { x: 0, y: 720 });
+        assert_eq!(top.local_position, Point { x: 0, y: 0 });
+        assert_eq!(bottom.local_position, Point { x: 0, y: 1439 });
     }
 
     #[test]
-    fn routes_between_mixed_screens_at_negative_coordinates() {
+    fn routes_in_each_grid_direction() {
         let topology = Topology::new(vec![
-            screen("left", -2560, -360, 2560, 1440),
-            screen("right", 0, 0, 1920, 1080),
+            screen("center", 2, 2, 1920, 1080),
+            screen("left", 1, 2, 1920, 1080),
+            screen("right", 3, 2, 1920, 1080),
+            screen("top", 2, 1, 1920, 1080),
+            screen("bottom", 2, 3, 1920, 1080),
         ])
         .unwrap_or_else(|error| panic!("topology should be valid: {error}"));
 
-        let transition = topology
-            .transition(&node("left"), Edge::Right, 900)
-            .unwrap_or_else(|| panic!("expected an adjacent screen"));
-
-        assert_eq!(transition.target, &node("right"));
-        assert_eq!(transition.local_position, Point { x: 0, y: 540 });
         assert_eq!(
             topology
-                .screen_at(Point { x: -1, y: 719 })
-                .map(|screen| &screen.node),
+                .transition(&node("center"), Edge::Left, 10)
+                .map(|transition| transition.target),
             Some(&node("left"))
+        );
+        assert_eq!(
+            topology
+                .transition(&node("center"), Edge::Right, 10)
+                .map(|transition| transition.target),
+            Some(&node("right"))
+        );
+        assert_eq!(
+            topology
+                .transition(&node("center"), Edge::Top, 10)
+                .map(|transition| transition.target),
+            Some(&node("top"))
+        );
+        assert_eq!(
+            topology
+                .transition(&node("center"), Edge::Bottom, 10)
+                .map(|transition| transition.target),
+            Some(&node("bottom"))
         );
     }
 
     #[test]
-    fn rejects_overlapping_screens() {
-        let result = Topology::new(vec![
-            screen("left", 0, 0, 1920, 1080),
-            screen("right", 1919, 0, 1920, 1080),
-        ]);
-
+    fn rejects_duplicate_and_out_of_range_slots() {
         assert!(matches!(
-            result,
-            Err(TopologyError::OverlappingScreens { .. })
+            Topology::new(vec![
+                screen("first", 2, 2, 1920, 1080),
+                screen("second", 2, 2, 1920, 1080),
+            ]),
+            Err(TopologyError::OccupiedSlot(_))
+        ));
+        assert!(matches!(
+            Topology::new(vec![screen("outside", TOPOLOGY_COLUMNS, 0, 1920, 1080)]),
+            Err(TopologyError::SlotOutOfBounds { .. })
         ));
     }
 
     #[test]
-    fn rejects_disconnected_screens() {
-        let result = Topology::new(vec![
-            screen("left", 0, 0, 1920, 1080),
-            screen("island", 3000, 0, 1920, 1080),
-        ]);
-
+    fn rejects_disconnected_nodes() {
         assert!(matches!(
-            result,
+            Topology::new(vec![
+                screen("center", 2, 2, 1920, 1080),
+                screen("island", 4, 4, 1920, 1080),
+            ]),
             Err(TopologyError::DisconnectedNode(node_id)) if node_id == node("island")
-        ));
-    }
-
-    #[test]
-    fn rejects_screens_larger_than_the_coordinate_domain() {
-        let result = Topology::new(vec![screen("wide", i32::MIN, 0, u32::MAX, 1080)]);
-
-        assert!(matches!(
-            result,
-            Err(TopologyError::CoordinateOverflow(node_id)) if node_id == node("wide")
         ));
     }
 }

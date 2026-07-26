@@ -2,14 +2,6 @@ use std::ffi::OsString;
 
 use crate::{EnvironmentStatus, HostPlatform, PlatformIssue, PlatformReport};
 
-pub(crate) const fn native_capture_backend() -> capture_engine::Backend {
-    capture_engine::Backend::InputCapturePortal
-}
-
-pub(crate) const fn native_emulation_backend() -> emulation_engine::Backend {
-    emulation_engine::Backend::Libei
-}
-
 pub(crate) const fn native_capture_kind() -> crate::BackendKind {
     crate::BackendKind::LinuxWaylandInputCapture
 }

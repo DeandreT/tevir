@@ -11,7 +11,6 @@ publish.workspace = true
 [dependencies]
 domain = { path = "../domain" }
 futures-util.workspace = true
-input-event = { version = "0.4.0", default-features = false }
 keycode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,13 +20,15 @@ tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd.workspace = true
-capture-engine = { package = "input-capture", version = "0.4.0", default-features = false, features = ["libei"] }
-emulation-engine = { package = "input-emulation", version = "0.4.0", default-features = false, features = ["libei"] }
+input-event = { version = "0.4.0", default-features = false, features = ["libei"] }
+reis.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 arboard.workspace = true
 capture-engine = { package = "input-capture", version = "0.4.0", default-features = false }
+enigo = { version = "0.6.1", default-features = false }
 emulation-engine = { package = "input-emulation", version = "0.4.0", default-features = false }
+input-event = { version = "0.4.0", default-features = false }
 
 [lints]
 workspace = true

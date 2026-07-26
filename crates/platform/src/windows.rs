@@ -1,13 +1,5 @@
 use crate::{EnvironmentStatus, HostPlatform, PlatformReport};
 
-pub(crate) const fn native_capture_backend() -> capture_engine::Backend {
-    capture_engine::Backend::Windows
-}
-
-pub(crate) const fn native_emulation_backend() -> emulation_engine::Backend {
-    emulation_engine::Backend::Windows
-}
-
 pub(crate) const fn native_capture_kind() -> crate::BackendKind {
     crate::BackendKind::WindowsHooks
 }

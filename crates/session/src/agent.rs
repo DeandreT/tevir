@@ -307,8 +307,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use domain::{
-        Edge, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point, Rect, ScreenPlacement,
-        Size, Topology,
+        Edge, GridSlot, InputEvent, InputKind, KeyAction, NodeId, PhysicalKey, Point,
+        ScreenPlacement, Size, Topology,
     };
     use protocol::{InputBatch, Session};
 
@@ -512,11 +512,13 @@ mod tests {
         let topology = Topology::new(vec![
             ScreenPlacement {
                 node: node("controller"),
-                bounds: Rect::new(Point { x: -1920, y: 0 }, size(1920, 1080)),
+                slot: GridSlot::new(1, 2),
+                size: size(1920, 1080),
             },
             ScreenPlacement {
                 node: node("agent"),
-                bounds: Rect::new(Point { x: 0, y: 0 }, size(2560, 1440)),
+                slot: GridSlot::new(2, 2),
+                size: size(2560, 1440),
             },
         ])
         .unwrap_or_else(|error| panic!("topology failed: {error}"));

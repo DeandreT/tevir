@@ -9,16 +9,18 @@ use std::{
     time::Duration,
 };
 
-use domain::{Edge, InputEvent};
-use futures_util::StreamExt;
+use domain::{Edge, InputEvent, Point};
 use serde::Serialize;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::{
     BackendError,
     convert::{from_native, to_native},
+    native_input::{NativeCapture, NativeCaptureEvent, NativeInjection},
     state::HeldInput,
 };
+
+pub use crate::native_input::DesktopGeometry;
 
 const ENGINE_HANDLE: u64 = 1;
 const ALL_CAPTURE_EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
@@ -43,7 +45,9 @@ pub enum CaptureServiceEvent {
     },
     Activated {
         edge: Edge,
+        edge_position: Option<f64>,
     },
+    DesktopChanged(DesktopGeometry),
     Input(InputEvent),
     Released,
     Failed {
@@ -58,6 +62,7 @@ pub enum InjectionServiceEvent {
     Ready {
         backend: BackendKind,
     },
+    DesktopChanged(DesktopGeometry),
     Applied {
         generation: u64,
         sequence: u64,
@@ -85,6 +90,10 @@ enum InjectionCommand {
         generation: u64,
         sequence: u64,
         events: Vec<InputEvent>,
+    },
+    WarpCursor {
+        generation: u64,
+        position: Point,
     },
     ReleaseAll {
         generation: u64,
@@ -260,6 +269,13 @@ impl InjectionService {
         })
     }
 
+    pub fn warp_cursor(&self, generation: u64, position: Point) -> Result<(), BackendError> {
+        self.send(InjectionCommand::WarpCursor {
+            generation,
+            position,
+        })
+    }
+
     pub fn release_all(&self, generation: u64) -> Result<(), BackendError> {
         self.send(InjectionCommand::ReleaseAll { generation })
     }
@@ -385,25 +401,29 @@ async fn run_capture(
     edges: Vec<Edge>,
     ready: Arc<AtomicBool>,
 ) {
-    let mut capture =
-        match capture_engine::InputCapture::new(Some(crate::native_capture_backend())).await {
-            Ok(capture) => capture,
-            Err(error) => {
-                send_capture_failure(&events, "open native capture", &error);
-                return;
-            }
-        };
+    let mut capture = match NativeCapture::new().await {
+        Ok(capture) => capture,
+        Err(error) => {
+            send_capture_failure(&events, "open native capture", &error);
+            return;
+        }
+    };
 
     for edge in ALL_CAPTURE_EDGES {
-        let handle = capture_handle(edge);
-        if let Err(error) = capture
-            .create(handle, capture_position_from_edge(edge))
-            .await
-        {
+        if let Err(error) = capture.create(edge).await {
             send_capture_failure(&events, "create capture edge", &error);
             let _ = capture.terminate().await;
             return;
         }
+    }
+
+    if let Some(geometry) = capture.desktop_geometry()
+        && events
+            .send(CaptureServiceEvent::DesktopChanged(geometry))
+            .is_err()
+    {
+        let _ = capture.terminate().await;
+        return;
     }
 
     if events
@@ -461,18 +481,19 @@ async fn run_capture(
                     break;
                 };
                 match native {
-                    Ok((handle, capture_engine::CaptureEvent::Begin)) => {
-                        let Some(edge) = capture_edge(handle) else {
-                            send_capture_failure(
-                                &events,
-                                "activate capture edge",
-                                &format_args!("unknown capture handle {handle}"),
-                            );
-                            continue;
-                        };
+                    Ok(NativeCaptureEvent::Activated {
+                        edge,
+                        edge_position,
+                    }) => {
                         if enabled_edges.contains(&edge) {
                             accepting_input = true;
-                            if events.send(CaptureServiceEvent::Activated { edge }).is_err() {
+                            if events
+                                .send(CaptureServiceEvent::Activated {
+                                    edge,
+                                    edge_position,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         } else {
@@ -482,7 +503,7 @@ async fn run_capture(
                             }
                         }
                     }
-                    Ok((_, capture_engine::CaptureEvent::Input(native))) => {
+                    Ok(NativeCaptureEvent::Input(native)) => {
                         if !accepting_input {
                             continue;
                         }
@@ -499,6 +520,20 @@ async fn run_capture(
                                 "normalize captured input",
                                 &error,
                             ),
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    Ok(NativeCaptureEvent::DesktopChanged(geometry)) => {
+                        accepting_input = false;
+                        emit_capture_releases(&events, &mut held);
+                        if let Err(error) = capture.release().await {
+                            send_capture_failure(&events, "release changed desktop", &error);
+                        }
+                        if events
+                            .send(CaptureServiceEvent::DesktopChanged(geometry))
+                            .is_err()
+                        {
+                            break;
                         }
                     }
                     Err(error) => {
@@ -532,25 +567,28 @@ async fn run_injection(
     ready: Arc<AtomicBool>,
     ever_ready: Arc<AtomicBool>,
 ) {
-    let mut injection = match emulation_engine::InputEmulation::new(Some(
-        crate::native_emulation_backend(),
-    ))
-    .await
-    {
+    let mut injection = match NativeInjection::new().await {
         Ok(injection) => injection,
         Err(error) => {
             send_injection_failure(&events, "open native injection", &error);
             return;
         }
     };
-    let _created = injection.create(ENGINE_HANDLE).await;
+    if let Some(geometry) = injection.desktop_geometry()
+        && events
+            .send(InjectionServiceEvent::DesktopChanged(geometry))
+            .is_err()
+    {
+        let _ = injection.terminate().await;
+        return;
+    }
     if events
         .send(InjectionServiceEvent::Ready {
             backend: crate::native_emulation_kind(),
         })
         .is_err()
     {
-        injection.terminate().await;
+        let _ = injection.terminate().await;
         return;
     }
     ready.store(true, Ordering::Release);
@@ -562,7 +600,14 @@ async fn run_injection(
 
     let mut held = HeldInput::default();
     let mut active_generation = 0;
-    'commands: while let Some(command) = commands.recv().await {
+    let mut display_tick = tokio::time::interval(Duration::from_millis(250));
+    display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    'commands: loop {
+        tokio::select! {
+        command = commands.recv() => {
+        let Some(command) = command else {
+            break;
+        };
         match command {
             InjectionCommand::BeginSession { generation } => {
                 release_injected_input(&mut injection, &events, &mut held, active_generation).await;
@@ -609,6 +654,16 @@ async fn run_injection(
                     break 'commands;
                 }
             }
+            InjectionCommand::WarpCursor {
+                generation,
+                position,
+            } => {
+                if generation == active_generation
+                    && let Err(error) = injection.warp_cursor(position).await
+                {
+                    send_injection_failure(&events, "position remote pointer", &error);
+                }
+            }
             InjectionCommand::ReleaseAll { generation } => {
                 if generation == active_generation {
                     release_injected_input(&mut injection, &events, &mut held, active_generation)
@@ -616,18 +671,36 @@ async fn run_injection(
                 }
             }
         }
+        }
+        _ = display_tick.tick() => {
+            match injection.try_display_change() {
+                Ok(Some(geometry)) => {
+                    if events
+                        .send(InjectionServiceEvent::DesktopChanged(geometry))
+                        .is_err()
+                    {
+                        break 'commands;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    send_injection_failure(&events, "monitor native display", &error);
+                    break 'commands;
+                }
+            }
+        }
+        }
     }
 
     release_injected_input(&mut injection, &events, &mut held, active_generation).await;
-    injection.destroy(ENGINE_HANDLE).await;
-    injection.terminate().await;
+    let _ = injection.terminate().await;
     ready.store(false, Ordering::Release);
     let _ = events.send(InjectionServiceEvent::Stopped);
     tracing::info!("input injection service stopped");
 }
 
 async fn release_injected_input(
-    injection: &mut emulation_engine::InputEmulation,
+    injection: &mut NativeInjection,
     events: &SyncSender<InjectionServiceEvent>,
     held: &mut HeldInput,
     generation: u64,
@@ -672,43 +745,13 @@ fn send_injection_failure(
     });
 }
 
-const fn capture_position_from_edge(edge: Edge) -> capture_engine::Position {
-    match edge {
-        Edge::Left => capture_engine::Position::Left,
-        Edge::Right => capture_engine::Position::Right,
-        Edge::Top => capture_engine::Position::Top,
-        Edge::Bottom => capture_engine::Position::Bottom,
-    }
-}
-
-const fn capture_handle(edge: Edge) -> u64 {
-    match edge {
-        Edge::Left => 1,
-        Edge::Right => 2,
-        Edge::Top => 3,
-        Edge::Bottom => 4,
-    }
-}
-
-const fn capture_edge(handle: u64) -> Option<Edge> {
-    match handle {
-        1 => Some(Edge::Left),
-        2 => Some(Edge::Right),
-        3 => Some(Edge::Top),
-        4 => Some(Edge::Bottom),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
 
     use domain::Edge;
 
-    use super::{
-        ALL_CAPTURE_EDGES, capture_edge, capture_handle, take_injection_generation, validate_edges,
-    };
+    use super::{take_injection_generation, validate_edges};
     use crate::BackendError;
 
     #[test]
@@ -716,15 +759,6 @@ mod tests {
         assert!(validate_edges(&[]).is_ok());
         assert!(validate_edges(&[Edge::Left, Edge::Left]).is_err());
         assert!(validate_edges(&[Edge::Left, Edge::Right]).is_ok());
-    }
-
-    #[test]
-    fn native_capture_handles_are_stable_for_every_edge() {
-        for edge in ALL_CAPTURE_EDGES {
-            assert_eq!(capture_edge(capture_handle(edge)), Some(edge));
-        }
-        assert_eq!(capture_edge(0), None);
-        assert_eq!(capture_edge(5), None);
     }
 
     #[test]

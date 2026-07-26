@@ -7,15 +7,14 @@ listen = "0.0.0.0:24800"
 
 [[role.screens]]
 node = "left-desk"
-x = 0
-y = 0
+column = 2
+row = 2
 width = 1920
 height = 1080
 
 [[role.screens]]
 node = "right-desk"
-x = 1920
-y = 0
+column = 3
+row = 2
 width = 2560
 height = 1440
-
