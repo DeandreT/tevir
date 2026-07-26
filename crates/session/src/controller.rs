@@ -514,16 +514,16 @@ mod tests {
     }
 
     fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
-        ScreenPlacement {
-            node: node(node_id),
-            bounds: Rect::new(
+        ScreenPlacement::single(
+            node(node_id),
+            Rect::new(
                 Point { x, y },
                 Size::new(
                     NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
                     NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
                 ),
             ),
-        }
+        )
     }
 
     fn topology() -> Topology {

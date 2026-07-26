@@ -1,11 +1,22 @@
-use domain::{Edge, Point, Size};
+use domain::{DesktopLayout, Edge, Point, Size};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopGeometry {
     pub origin: Point,
-    pub size: Size,
-    pub monitor_count: u32,
+    pub layout: DesktopLayout,
+}
+
+impl DesktopGeometry {
+    #[must_use]
+    pub const fn size(&self) -> Size {
+        self.layout.size()
+    }
+
+    #[must_use]
+    pub fn monitor_count(&self) -> usize {
+        self.layout.monitor_count()
+    }
 }
 
 #[derive(Debug)]
@@ -71,7 +82,10 @@ mod platform {
         time::{Duration, timeout},
     };
 
-    use super::{DesktopGeometry, Edge, NativeCaptureEvent, NativeInputError, Point, Size};
+    use super::{
+        DesktopGeometry, DesktopLayout, Edge, NativeCaptureEvent, NativeInputError, Point, Size,
+    };
+    use domain::{Monitor, Rect};
 
     const NATIVE_EVENT_CAPACITY: usize = 256;
     const DEVICE_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -190,11 +204,10 @@ mod platform {
         }
 
         pub(crate) fn desktop_geometry(&self) -> Option<DesktopGeometry> {
-            Some(
-                self.geometry
-                    .read()
-                    .map_or_else(|poisoned| *poisoned.into_inner(), |geometry| *geometry),
-            )
+            Some(self.geometry.read().map_or_else(
+                |poisoned| poisoned.into_inner().clone(),
+                |geometry| geometry.clone(),
+            ))
         }
 
         pub(crate) async fn release(&mut self) -> Result<(), NativeInputError> {
@@ -318,7 +331,7 @@ mod platform {
                         let next_geometry = desktop_geometry(&zones)?;
                         let next_barriers = install_barriers(&portal, &session, &zones).await?;
                         if let Ok(mut value) = geometry.write() {
-                            *value = next_geometry;
+                            *value = next_geometry.clone();
                         }
                         if let Ok(mut value) = barriers.write() {
                             *value = next_barriers
@@ -371,7 +384,7 @@ mod platform {
             let geometry = geometry.read().map_err(|_| {
                 NativeInputError::message("InputCapture geometry state is poisoned")
             })?;
-            normalized_edge_position(*geometry, barrier.edge, cursor)
+            normalized_edge_position(&geometry, barrier.edge, cursor)
         };
 
         if let Ok(mut value) = active.lock() {
@@ -472,7 +485,9 @@ mod platform {
     fn geometry_from_rectangles(
         rectangles: impl Iterator<Item = (i64, i64, u64, u64)>,
     ) -> Result<DesktopGeometry, NativeInputError> {
-        let rectangles = rectangles.collect::<Vec<_>>();
+        let mut rectangles = rectangles.collect::<Vec<_>>();
+        rectangles.sort_unstable();
+        rectangles.dedup();
         let Some(&(first_x, first_y, first_width, first_height)) = rectangles.first() else {
             return Err(NativeInputError::message(
                 "the compositor reported no desktop regions",
@@ -500,6 +515,36 @@ mod platform {
             .ok_or_else(|| {
                 NativeInputError::message("desktop height exceeds the supported range")
             })?;
+        let monitors = rectangles
+            .into_iter()
+            .enumerate()
+            .map(|(index, (x, y, width, height))| {
+                let x = i32::try_from(x.saturating_sub(left)).map_err(|_| {
+                    NativeInputError::message("monitor X offset exceeds the supported range")
+                })?;
+                let y = i32::try_from(y.saturating_sub(top)).map_err(|_| {
+                    NativeInputError::message("monitor Y offset exceeds the supported range")
+                })?;
+                let width = u32::try_from(width)
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .ok_or_else(|| {
+                        NativeInputError::message("monitor width exceeds the supported range")
+                    })?;
+                let height = u32::try_from(height)
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .ok_or_else(|| {
+                        NativeInputError::message("monitor height exceeds the supported range")
+                    })?;
+                Ok(Monitor::new(
+                    Some(format!("Display {}", index + 1)),
+                    Rect::new(Point { x, y }, Size::new(width, height)),
+                ))
+            })
+            .collect::<Result<Vec<_>, NativeInputError>>()?;
+        let layout = DesktopLayout::new(Size::new(width, height), monitors)
+            .map_err(|error| NativeInputError::context("validate desktop layout", error))?;
         Ok(DesktopGeometry {
             origin: Point {
                 x: i32::try_from(left).map_err(|_| {
@@ -509,8 +554,7 @@ mod platform {
                     NativeInputError::message("desktop Y origin exceeds the supported range")
                 })?,
             },
-            size: Size::new(width, height),
-            monitor_count: u32::try_from(rectangles.len()).unwrap_or(u32::MAX),
+            layout,
         })
     }
 
@@ -543,17 +587,17 @@ mod platform {
         (cursor.0 - closest_x).hypot(cursor.1 - closest_y)
     }
 
-    fn normalized_edge_position(geometry: DesktopGeometry, edge: Edge, cursor: (f32, f32)) -> f64 {
+    fn normalized_edge_position(geometry: &DesktopGeometry, edge: Edge, cursor: (f32, f32)) -> f64 {
         let (value, start, length) = match edge {
             Edge::Left | Edge::Right => (
                 f64::from(cursor.1),
                 f64::from(geometry.origin.y),
-                f64::from(geometry.size.height.get()),
+                f64::from(geometry.size().height.get()),
             ),
             Edge::Top | Edge::Bottom => (
                 f64::from(cursor.0),
                 f64::from(geometry.origin.x),
-                f64::from(geometry.size.width.get()),
+                f64::from(geometry.size().width.get()),
             ),
         };
         ((value - start) / length.max(1.0)).clamp(0.0, 1.0)
@@ -592,7 +636,7 @@ mod platform {
             if let Some(pointer_absolute) = device.interface::<PointerAbsolute>() {
                 let next_geometry = geometry_from_device(device)?;
                 self.pointer_absolute = Some((native.clone(), pointer_absolute));
-                self.geometry = Some(next_geometry);
+                self.geometry = Some(next_geometry.clone());
                 geometry = Some(next_geometry);
             }
             if let Some(keyboard) = device.interface::<Keyboard>() {
@@ -721,7 +765,7 @@ mod platform {
         }
 
         pub(crate) fn desktop_geometry(&self) -> Option<DesktopGeometry> {
-            Some(self.geometry)
+            Some(self.geometry.clone())
         }
 
         pub(crate) fn try_display_change(
@@ -729,7 +773,7 @@ mod platform {
         ) -> Result<Option<DesktopGeometry>, NativeInputError> {
             match self.events.try_recv() {
                 Ok(InjectionNativeEvent::DisplayChanged(geometry)) => {
-                    self.geometry = geometry;
+                    self.geometry = geometry.clone();
                     Ok(Some(geometry))
                 }
                 Ok(InjectionNativeEvent::Failed(error)) => Err(error),
@@ -942,7 +986,7 @@ mod platform {
                 return;
             }
             let state = match devices.read() {
-                Ok(devices) => (devices.is_ready(), devices.geometry),
+                Ok(devices) => (devices.is_ready(), devices.geometry.clone()),
                 Err(_) => {
                     let _ = events
                         .send(InjectionNativeEvent::Failed(NativeInputError::message(
@@ -958,8 +1002,10 @@ mod platform {
                     .send(InjectionNativeEvent::Ready(state.1.unwrap_or(
                         DesktopGeometry {
                             origin: Point { x: 0, y: 0 },
-                            size: Size::new(NonZeroU32::MIN, NonZeroU32::MIN),
-                            monitor_count: 1,
+                            layout: DesktopLayout::single(Size::new(
+                                NonZeroU32::MIN,
+                                NonZeroU32::MIN,
+                            )),
                         },
                     )))
                     .await

@@ -1,13 +1,12 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    num::NonZeroU32,
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
-use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Topology};
 use identity::{LocalIdentity, TrustStore};
 use platform::{
     BackendKind, CaptureService, CaptureServiceEvent, DesktopGeometry, InjectionService,
@@ -168,7 +167,6 @@ pub enum RuntimeEvent {
     },
     DisplayChanged {
         screen: ScreenPlacement,
-        monitor_count: u32,
     },
     Error {
         message: String,
@@ -252,14 +250,14 @@ fn run_worker(
             Role::Agent {
                 controller_node,
                 controller,
-                display_size,
+                display_layout,
             },
             NativeInputHost::Agent(injection),
         ) => runtime.block_on(run_agent(
             config.node,
             controller_node,
             controller,
-            display_size,
+            display_layout,
             identity,
             trust,
             injection.clone(),
@@ -526,7 +524,7 @@ fn drain_capture_events(
                 );
             }
             CaptureServiceEvent::DesktopChanged(geometry) => {
-                let updated = resize_topology_screen(topology, local_node, geometry.size)
+                let updated = resize_topology_screen(topology, local_node, &geometry.layout)
                     .map_err(RuntimeError::Session)?;
                 if updated != *topology {
                     let actions = controller
@@ -620,11 +618,8 @@ fn handle_controller_network(
             session_id,
             message,
         } if active_session(peers, &peer, session_id) => match message {
-            Session::DisplayChanged {
-                size,
-                monitor_count,
-            } => {
-                let updated = match resize_topology_screen(topology, &peer, size) {
+            Session::DisplayChanged { layout } => {
+                let updated = match resize_topology_screen(topology, &peer, &layout) {
                     Ok(updated) => updated,
                     Err(error) => {
                         tracing::warn!(%peer, %error, "agent display update rejected");
@@ -667,17 +662,12 @@ fn handle_controller_network(
                 }
                 tracing::info!(
                     peer = %peer,
-                    width = size.width.get(),
-                    height = size.height.get(),
+                    width = layout.size().width.get(),
+                    height = layout.size().height.get(),
+                    monitors = layout.monitor_count(),
                     "agent display synchronized"
                 );
-                send_event(
-                    events,
-                    RuntimeEvent::DisplayChanged {
-                        screen,
-                        monitor_count: monitor_count.get(),
-                    },
-                );
+                send_event(events, RuntimeEvent::DisplayChanged { screen });
             }
             Session::InputAcknowledged { through_sequence } => {
                 controller
@@ -771,7 +761,7 @@ async fn run_agent(
     local_node: NodeId,
     controller_node: NodeId,
     controller_address: SocketAddr,
-    display_size: domain::Size,
+    display_layout: DesktopLayout,
     identity: LocalIdentity,
     trust: TrustStore,
     injection: InjectionService,
@@ -808,8 +798,7 @@ async fn run_agent(
     let mut attempt = 0u32;
     let mut display_geometry = DesktopGeometry {
         origin: domain::Point { x: 0, y: 0 },
-        size: display_size,
-        monitor_count: 1,
+        layout: display_layout,
     };
 
     loop {
@@ -923,7 +912,7 @@ async fn run_agent_connection(
         .map_err(|error| RuntimeError::Native(error.to_string()))?;
     let (mut sender, receiver) = connection.split_control();
     let (mut inbound, reader_worker) = spawn_control_reader(receiver);
-    let mut agent = AgentSession::new(local_node.clone(), display_geometry.size);
+    let mut agent = AgentSession::new(local_node.clone(), display_geometry.size());
     let mut input_tick = tokio::time::interval(INPUT_POLL_INTERVAL);
     input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut controlled = false;
@@ -932,22 +921,20 @@ async fn run_agent_connection(
     let outcome = async {
         sender
             .send(Session::DisplayChanged {
-                size: display_geometry.size,
-                monitor_count: NonZeroU32::new(display_geometry.monitor_count)
-                    .unwrap_or(NonZeroU32::MIN),
+                layout: display_geometry.layout.clone(),
             })
             .await
             .map_err(|error| RuntimeError::Transport(error.to_string()))?;
         tracing::info!(
-            width = display_geometry.size.width.get(),
-            height = display_geometry.size.height.get(),
-            monitors = display_geometry.monitor_count,
+            width = display_geometry.size().width.get(),
+            height = display_geometry.size().height.get(),
+            monitors = display_geometry.monitor_count(),
             "agent display reported"
         );
         send_event(
             events,
             RuntimeEvent::LocalDesktopChanged {
-                geometry: *display_geometry,
+                geometry: display_geometry.clone(),
             },
         );
         'session: loop {
@@ -1002,9 +989,9 @@ async fn run_agent_connection(
                         }
                         InjectionServiceEvent::DesktopChanged(geometry) => {
                             if geometry != *display_geometry {
-                                *display_geometry = geometry;
+                                *display_geometry = geometry.clone();
                                 application_pending = false;
-                                let actions = agent.reconcile_display(geometry.size);
+                                let actions = agent.reconcile_display(geometry.size());
                                 apply_agent_actions(
                                     actions,
                                     injection,
@@ -1014,9 +1001,7 @@ async fn run_agent_connection(
                                 .await?;
                                 sender
                                     .send(Session::DisplayChanged {
-                                        size: geometry.size,
-                                        monitor_count: NonZeroU32::new(geometry.monitor_count)
-                                            .unwrap_or(NonZeroU32::MIN),
+                                        layout: geometry.layout.clone(),
                                     })
                                     .await
                                     .map_err(|error| {
@@ -1031,12 +1016,14 @@ async fn run_agent_connection(
                                 }
                                 send_event(
                                     events,
-                                    RuntimeEvent::LocalDesktopChanged { geometry },
+                                    RuntimeEvent::LocalDesktopChanged {
+                                        geometry: geometry.clone(),
+                                    },
                                 );
                                 tracing::info!(
-                                    width = geometry.size.width.get(),
-                                    height = geometry.size.height.get(),
-                                    monitors = geometry.monitor_count,
+                                    width = geometry.size().width.get(),
+                                    height = geometry.size().height.get(),
+                                    monitors = geometry.monitor_count(),
                                     "agent display change reported"
                                 );
                             }
@@ -1217,14 +1204,15 @@ fn capture_edges(topology: &Topology, local_node: &NodeId) -> Vec<Edge> {
 fn resize_topology_screen(
     topology: &Topology,
     node: &NodeId,
-    size: Size,
+    layout: &DesktopLayout,
 ) -> Result<Topology, String> {
     let current = topology
         .screen(node)
         .ok_or_else(|| format!("node `{node}` is not present in the topology"))?;
-    if current.bounds.size == size {
+    if current.layout == *layout {
         return Ok(topology.clone());
     }
+    let size = layout.size();
 
     let old_width = i64::from(current.bounds.size.width.get());
     let old_height = i64::from(current.bounds.size.height.get());
@@ -1263,6 +1251,7 @@ fn resize_topology_screen(
         .map(|mut screen| {
             if &screen.node == node {
                 screen.bounds = Rect::new(origin, size);
+                screen.layout = layout.clone();
             }
             screen
         })
@@ -1421,7 +1410,7 @@ mod tests {
         time::Duration,
     };
 
-    use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+    use domain::{DesktopLayout, Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
     use identity::{IdentityStore, LocalIdentity, TrustStore};
     use protocol::Session;
     use tempfile::TempDir;
@@ -1438,16 +1427,16 @@ mod tests {
     }
 
     fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
-        ScreenPlacement {
-            node: node(node_id),
-            bounds: Rect::new(
+        ScreenPlacement::single(
+            node(node_id),
+            Rect::new(
                 Point { x, y },
                 Size::new(
                     NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
                     NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
                 ),
             ),
-        }
+        )
     }
 
     fn identity(directory: &TempDir, node_id: &str) -> LocalIdentity {
@@ -1513,10 +1502,10 @@ mod tests {
         let updated = resize_topology_screen(
             &topology,
             &node("right"),
-            Size::new(
+            &DesktopLayout::single(Size::new(
                 NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
                 NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
-            ),
+            )),
         )
         .unwrap_or_else(|error| panic!("display update should be valid: {error}"));
 
@@ -1537,10 +1526,10 @@ mod tests {
         let updated = resize_topology_screen(
             &topology,
             &node("left"),
-            Size::new(
+            &DesktopLayout::single(Size::new(
                 NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
                 NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
-            ),
+            )),
         )
         .unwrap_or_else(|error| panic!("display update should be valid: {error}"));
 

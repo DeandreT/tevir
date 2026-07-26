@@ -510,14 +510,14 @@ mod tests {
     #[test]
     fn controller_and_agent_complete_an_acknowledged_batch() {
         let topology = Topology::new(vec![
-            ScreenPlacement {
-                node: node("controller"),
-                bounds: Rect::new(Point { x: 0, y: 180 }, size(1920, 1080)),
-            },
-            ScreenPlacement {
-                node: node("agent"),
-                bounds: Rect::new(Point { x: 1920, y: 0 }, size(2560, 1440)),
-            },
+            ScreenPlacement::single(
+                node("controller"),
+                Rect::new(Point { x: 0, y: 180 }, size(1920, 1080)),
+            ),
+            ScreenPlacement::single(
+                node("agent"),
+                Rect::new(Point { x: 1920, y: 0 }, size(2560, 1440)),
+            ),
         ])
         .unwrap_or_else(|error| panic!("topology failed: {error}"));
         let mut controller = ControllerSession::new(topology, node("controller"))

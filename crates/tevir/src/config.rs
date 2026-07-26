@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use domain::{NodeId, Point, Rect, ScreenPlacement, Size, Topology, TopologyError};
+use domain::{DesktopLayout, NodeId, Point, Rect, ScreenPlacement, Size, Topology, TopologyError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -24,7 +24,7 @@ pub enum Role {
     Agent {
         controller_node: NodeId,
         controller: SocketAddr,
-        display_size: Size,
+        display_layout: DesktopLayout,
     },
 }
 
@@ -101,7 +101,7 @@ impl ConfigFile {
             } => Role::Agent {
                 controller_node,
                 controller,
-                display_size: Size::new(display_width, display_height),
+                display_layout: DesktopLayout::single(Size::new(display_width, display_height)),
             },
         };
 
@@ -123,12 +123,12 @@ impl From<&Config> for ConfigFile {
             Role::Agent {
                 controller_node,
                 controller,
-                display_size,
+                display_layout,
             } => RoleFile::Agent {
                 controller_node: controller_node.clone(),
                 controller: *controller,
-                display_width: display_size.width,
-                display_height: display_size.height,
+                display_width: display_layout.size().width,
+                display_height: display_layout.size().height,
             },
         };
         Self {
@@ -173,16 +173,16 @@ struct Screen {
 
 impl Screen {
     fn into_placement(self) -> ScreenPlacement {
-        ScreenPlacement {
-            node: self.node,
-            bounds: Rect::new(
+        ScreenPlacement::single(
+            self.node,
+            Rect::new(
                 Point {
                     x: self.x,
                     y: self.y,
                 },
                 Size::new(self.width, self.height),
             ),
-        }
+        )
     }
 
     fn from_placement(placement: &ScreenPlacement) -> Self {
@@ -333,11 +333,11 @@ mod tests {
             config.role,
             Role::Agent {
                 controller_node,
-                display_size,
+                display_layout,
                 ..
             } if controller_node.as_str() == "left"
-                && display_size.width.get() == 2560
-                && display_size.height.get() == 1440
+                && display_layout.size().width.get() == 2560
+                && display_layout.size().height.get() == 1440
         ));
     }
 

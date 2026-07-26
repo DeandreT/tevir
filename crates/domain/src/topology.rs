@@ -3,12 +3,37 @@ use std::collections::{HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{NodeId, Point, Rect};
+use crate::{DesktopLayout, DesktopLayoutError, NodeId, Point, Rect};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScreenPlacement {
     pub node: NodeId,
     pub bounds: Rect,
+    pub layout: DesktopLayout,
+}
+
+impl ScreenPlacement {
+    #[must_use]
+    pub fn single(node: NodeId, bounds: Rect) -> Self {
+        Self {
+            node,
+            layout: DesktopLayout::single(bounds.size),
+            bounds,
+        }
+    }
+
+    pub fn with_layout(
+        node: NodeId,
+        origin: Point,
+        layout: DesktopLayout,
+    ) -> Result<Self, TopologyError> {
+        layout.validate().map_err(TopologyError::InvalidDesktop)?;
+        Ok(Self {
+            node,
+            bounds: Rect::new(origin, layout.size()),
+            layout,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -46,6 +71,13 @@ impl Topology {
         }
 
         for (index, first) in screens.iter().enumerate() {
+            first
+                .layout
+                .validate()
+                .map_err(TopologyError::InvalidDesktop)?;
+            if first.layout.size() != first.bounds.size {
+                return Err(TopologyError::DesktopSizeMismatch(first.node.clone()));
+            }
             if u64::from(first.bounds.size.width.get()) > i32::MAX as u64 + 1
                 || u64::from(first.bounds.size.height.get()) > i32::MAX as u64 + 1
                 || first.bounds.right() > i64::from(i32::MAX) + 1
@@ -98,6 +130,9 @@ impl Topology {
     #[must_use]
     pub fn transition(&self, current: &NodeId, edge: Edge, offset: u32) -> Option<Transition<'_>> {
         let source = self.screen(current)?;
+        if !source.layout.contains_edge_offset(edge, offset) {
+            return None;
+        }
         let axis = match edge {
             Edge::Left | Edge::Right => {
                 if offset >= source.bounds.size.height.get() {
@@ -125,6 +160,10 @@ impl Topology {
                             candidate.bounds.top(),
                             candidate.bounds.bottom(),
                             axis,
+                        )
+                        && candidate.layout.contains_edge_offset(
+                            Edge::Right,
+                            u32::try_from(axis - candidate.bounds.top()).ok()?,
                         ) =>
                 {
                     Point {
@@ -138,6 +177,10 @@ impl Topology {
                             candidate.bounds.top(),
                             candidate.bounds.bottom(),
                             axis,
+                        )
+                        && candidate.layout.contains_edge_offset(
+                            Edge::Left,
+                            u32::try_from(axis - candidate.bounds.top()).ok()?,
                         ) =>
                 {
                     Point {
@@ -151,6 +194,10 @@ impl Topology {
                             candidate.bounds.left(),
                             candidate.bounds.right(),
                             axis,
+                        )
+                        && candidate.layout.contains_edge_offset(
+                            Edge::Bottom,
+                            u32::try_from(axis - candidate.bounds.left()).ok()?,
                         ) =>
                 {
                     Point {
@@ -164,6 +211,10 @@ impl Topology {
                             candidate.bounds.left(),
                             candidate.bounds.right(),
                             axis,
+                        )
+                        && candidate.layout.contains_edge_offset(
+                            Edge::Top,
+                            u32::try_from(axis - candidate.bounds.left()).ok()?,
                         ) =>
                 {
                     Point {
@@ -197,7 +248,7 @@ fn connected_screen_indexes(screens: &[ScreenPlacement]) -> HashSet<usize> {
 
         for (candidate_index, candidate) in screens.iter().enumerate() {
             if !connected.contains(&candidate_index)
-                && screens[index].bounds.shares_edge(candidate.bounds)
+                && shares_exposed_edge(&screens[index], candidate)
             {
                 pending.push_back(candidate_index);
             }
@@ -205,6 +256,79 @@ fn connected_screen_indexes(screens: &[ScreenPlacement]) -> HashSet<usize> {
     }
 
     connected
+}
+
+fn shares_exposed_edge(first: &ScreenPlacement, second: &ScreenPlacement) -> bool {
+    if first.bounds.right() == second.bounds.left()
+        && segments_overlap(
+            first,
+            Edge::Right,
+            second,
+            Edge::Left,
+            first.bounds.top(),
+            second.bounds.top(),
+        )
+    {
+        return true;
+    }
+    if second.bounds.right() == first.bounds.left()
+        && segments_overlap(
+            first,
+            Edge::Left,
+            second,
+            Edge::Right,
+            first.bounds.top(),
+            second.bounds.top(),
+        )
+    {
+        return true;
+    }
+    if first.bounds.bottom() == second.bounds.top()
+        && segments_overlap(
+            first,
+            Edge::Bottom,
+            second,
+            Edge::Top,
+            first.bounds.left(),
+            second.bounds.left(),
+        )
+    {
+        return true;
+    }
+    second.bounds.bottom() == first.bounds.top()
+        && segments_overlap(
+            first,
+            Edge::Top,
+            second,
+            Edge::Bottom,
+            first.bounds.left(),
+            second.bounds.left(),
+        )
+}
+
+fn segments_overlap(
+    first: &ScreenPlacement,
+    first_edge: Edge,
+    second: &ScreenPlacement,
+    second_edge: Edge,
+    first_axis_origin: i64,
+    second_axis_origin: i64,
+) -> bool {
+    first
+        .layout
+        .edge_segments(first_edge)
+        .into_iter()
+        .any(|(first_start, first_end)| {
+            let first_start = first_axis_origin + i64::from(first_start);
+            let first_end = first_axis_origin + i64::from(first_end);
+            second.layout.edge_segments(second_edge).into_iter().any(
+                |(second_start, second_end)| {
+                    let second_start = second_axis_origin + i64::from(second_start);
+                    let second_end = second_axis_origin + i64::from(second_end);
+                    first_start < second_end && first_end > second_start
+                },
+            )
+        })
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -215,6 +339,10 @@ pub enum TopologyError {
     DuplicateNode(NodeId),
     #[error("screens for `{first}` and `{second}` overlap")]
     OverlappingScreens { first: NodeId, second: NodeId },
+    #[error("screen for `{0}` has bounds that do not match its desktop layout")]
+    DesktopSizeMismatch(NodeId),
+    #[error("screen has an invalid desktop layout: {0}")]
+    InvalidDesktop(DesktopLayoutError),
     #[error("screen for `{0}` extends beyond the supported coordinate range")]
     CoordinateOverflow(NodeId),
     #[error("screen for `{0}` does not share an edge with the connected topology")]
@@ -226,23 +354,24 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::{Edge, ScreenPlacement, Topology, TopologyError};
-    use crate::{NodeId, Point, Rect, Size};
+    use crate::{DesktopLayout, Monitor, NodeId, Point, Rect, Size};
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
     }
 
+    fn size(width: u32, height: u32) -> Size {
+        Size::new(
+            NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+            NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+        )
+    }
+
     fn screen(node_id: &str, x: i32, y: i32, width: u32, height: u32) -> ScreenPlacement {
-        ScreenPlacement {
-            node: node(node_id),
-            bounds: Rect::new(
-                Point { x, y },
-                Size::new(
-                    NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
-                    NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
-                ),
-            ),
-        }
+        ScreenPlacement::single(
+            node(node_id),
+            Rect::new(Point { x, y }, size(width, height)),
+        )
     }
 
     #[test]
@@ -309,6 +438,39 @@ mod tests {
                 .transition(&node("agent"), Edge::Left, 180)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn rejects_aggregate_neighbors_without_overlapping_monitor_edges() {
+        let source_layout = DesktopLayout::new(
+            size(100, 100),
+            vec![
+                Monitor::new(None, Rect::new(Point { x: 0, y: 0 }, size(100, 40))),
+                Monitor::new(None, Rect::new(Point { x: 0, y: 40 }, size(50, 60))),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("source layout should be valid: {error}"));
+        let target_layout = DesktopLayout::new(
+            size(100, 100),
+            vec![
+                Monitor::new(None, Rect::new(Point { x: 50, y: 0 }, size(50, 60))),
+                Monitor::new(None, Rect::new(Point { x: 0, y: 60 }, size(100, 40))),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("target layout should be valid: {error}"));
+
+        let result = Topology::new(vec![
+            ScreenPlacement::with_layout(node("source"), Point { x: 0, y: 0 }, source_layout)
+                .unwrap_or_else(|error| panic!("source placement should be valid: {error}")),
+            ScreenPlacement::with_layout(node("target"), Point { x: 100, y: 0 }, target_layout)
+                .unwrap_or_else(|error| panic!("target placement should be valid: {error}")),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(TopologyError::DisconnectedNode(disconnected))
+                if disconnected == node("target")
+        ));
     }
 
     #[test]

@@ -7,7 +7,9 @@ use std::{
 };
 
 use discovery::{DiscoveredNode, DiscoveryService, NearbyNodes};
-use domain::{NodeId, Point, Rect, ScreenPlacement, Size, Topology};
+use domain::{
+    DesktopLayout, DisplayRotation, Monitor, NodeId, Point, Rect, ScreenPlacement, Size, Topology,
+};
 use eframe::egui::{
     self, Align, Button, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Layout,
     Margin, RichText, ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, ViewportBuilder,
@@ -325,7 +327,7 @@ impl DesktopApp {
                     return;
                 }
                 self.config_editor = ConfigEditor::from_config(&config);
-                if let Some(geometry) = self.local_desktop {
+                if let Some(geometry) = self.local_desktop.clone() {
                     let _ = self.apply_local_desktop_to_editor(geometry);
                     if let Ok(updated) = self.config_editor.build(local_node.clone()) {
                         config = updated;
@@ -370,17 +372,17 @@ impl DesktopApp {
     fn sync_desktop_geometry(&mut self, frame: &eframe::Frame, context: &egui::Context) {
         let geometry = desktop_geometry(frame)
             .or_else(|| current_monitor_geometry(context))
-            .filter(|geometry| Some(*geometry) != self.local_desktop);
+            .filter(|geometry| self.local_desktop.as_ref() != Some(geometry));
         let Some(geometry) = geometry else {
             return;
         };
-        self.local_desktop = Some(geometry);
-        let result = self.apply_local_desktop_to_editor(geometry);
+        self.local_desktop = Some(geometry.clone());
+        let result = self.apply_local_desktop_to_editor(geometry.clone());
         match result {
             Ok(()) => tracing::info!(
-                width = geometry.size.width.get(),
-                height = geometry.size.height.get(),
-                monitors = geometry.monitor_count,
+                width = geometry.size().width.get(),
+                height = geometry.size().height.get(),
+                monitors = geometry.monitor_count(),
                 "local desktop geometry detected"
             ),
             Err(error) => tracing::warn!(error, "local desktop autofill failed"),
@@ -573,21 +575,19 @@ impl DesktopApp {
                     self.notice = Some(Notice::info(format!("Controlling {node}")));
                 }
                 RuntimeEvent::LocalDesktopChanged { geometry } => {
-                    self.local_desktop = Some(*geometry);
-                    let _ = self.apply_local_desktop_to_editor(*geometry);
+                    self.local_desktop = Some(geometry.clone());
+                    let _ = self.apply_local_desktop_to_editor(geometry.clone());
                 }
-                RuntimeEvent::DisplayChanged {
-                    screen,
-                    monitor_count,
-                } => {
-                    self.config_editor.update_screen(screen, *monitor_count);
+                RuntimeEvent::DisplayChanged { screen } => {
+                    self.config_editor.update_screen(screen);
+                    let monitor_count = screen.layout.monitor_count();
                     self.notice = Some(Notice::info(format!(
                         "{} desktop updated to {} x {} across {} display{}",
                         screen.node,
                         screen.bounds.size.width,
                         screen.bounds.size.height,
                         monitor_count,
-                        if *monitor_count == 1 { "" } else { "s" }
+                        if monitor_count == 1 { "" } else { "s" }
                     )));
                 }
                 RuntimeEvent::Error { message } => {
@@ -972,7 +972,7 @@ impl DesktopApp {
         });
         if previous_role != self.config_editor.role {
             self.stop_session();
-            if let Some(geometry) = self.local_desktop {
+            if let Some(geometry) = self.local_desktop.clone() {
                 let _ = self.apply_local_desktop_to_editor(geometry);
             }
             if let Err(error) = self.prepare_native_input(self.config_editor.role.runtime_role()) {
@@ -1044,8 +1044,8 @@ impl DesktopApp {
             "Local desktop",
             &format!(
                 "{} connected display{}",
-                self.config_editor.agent_monitor_count,
-                if self.config_editor.agent_monitor_count == 1 {
+                self.config_editor.agent_layout.monitor_count(),
+                if self.config_editor.agent_layout.monitor_count() == 1 {
                     ""
                 } else {
                     "s"
@@ -1191,12 +1191,33 @@ impl DesktopApp {
                     ui.label(
                         RichText::new(format!(
                             "{} display{}",
-                            screen.monitor_count,
-                            if screen.monitor_count == 1 { "" } else { "s" }
+                            screen.layout.monitor_count(),
+                            if screen.layout.monitor_count() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
                         ))
                         .small()
                         .color(MUTED),
                     );
+                    for (index, monitor) in screen.layout.monitors().iter().enumerate() {
+                        let name = monitor
+                            .name
+                            .as_deref()
+                            .map_or_else(|| format!("Display {}", index + 1), str::to_owned);
+                        ui.label(
+                            RichText::new(format!(
+                                "{name}: {} x {} at {}%, {}",
+                                monitor.bounds.size.width,
+                                monitor.bounds.size.height,
+                                monitor.scale_milli.get() / 10,
+                                rotation_label(monitor.rotation),
+                            ))
+                            .small()
+                            .color(MUTED),
+                        );
+                    }
                 }
                 ui.add_space(6.0);
                 if let Some(axis) = self.config_editor.alignment_axis(selected) {
@@ -1883,10 +1904,9 @@ impl SessionState {
                 self.agent_controlled = active;
             }
             RuntimeEvent::LocalDesktopChanged { .. } => {}
-            RuntimeEvent::DisplayChanged {
-                screen,
-                monitor_count,
-            } => {
+            RuntimeEvent::DisplayChanged { screen } => {
+                let monitor_count =
+                    u32::try_from(screen.layout.monitor_count()).unwrap_or(u32::MAX);
                 self.displays.insert(
                     screen.node,
                     RemoteDisplay {
@@ -1973,7 +1993,7 @@ struct ConfigEditor {
     controller_address: String,
     agent_width: String,
     agent_height: String,
-    agent_monitor_count: u32,
+    agent_layout: DesktopLayout,
     screens: Vec<ScreenEditor>,
     selected_screen: usize,
     canvas_view: Option<CanvasView>,
@@ -1989,7 +2009,10 @@ impl ConfigEditor {
             controller_address: String::from("127.0.0.1:24800"),
             agent_width: String::from("1920"),
             agent_height: String::from("1080"),
-            agent_monitor_count: 1,
+            agent_layout: DesktopLayout::single(Size::new(
+                NonZeroU32::new(1920).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(1080).unwrap_or(NonZeroU32::MIN),
+            )),
             screens: vec![ScreenEditor::from_node(
                 node.map_or_else(|| String::from("local-node"), ToString::to_string),
                 0,
@@ -2010,7 +2033,10 @@ impl ConfigEditor {
                 controller_address: String::from("127.0.0.1:24800"),
                 agent_width: String::from("1920"),
                 agent_height: String::from("1080"),
-                agent_monitor_count: 1,
+                agent_layout: DesktopLayout::single(Size::new(
+                    NonZeroU32::new(1920).unwrap_or(NonZeroU32::MIN),
+                    NonZeroU32::new(1080).unwrap_or(NonZeroU32::MIN),
+                )),
                 screens: topology
                     .screens()
                     .iter()
@@ -2023,15 +2049,15 @@ impl ConfigEditor {
             Role::Agent {
                 controller_node,
                 controller,
-                display_size,
+                display_layout,
             } => Self {
                 role: ConfigRole::Agent,
                 listen_address: String::from("0.0.0.0:24800"),
                 controller_node: controller_node.to_string(),
                 controller_address: controller.to_string(),
-                agent_width: display_size.width.to_string(),
-                agent_height: display_size.height.to_string(),
-                agent_monitor_count: 1,
+                agent_width: display_layout.size().width.to_string(),
+                agent_height: display_layout.size().height.to_string(),
+                agent_layout: display_layout.clone(),
                 screens: vec![ScreenEditor::from_local_node(&config.node)],
                 selected_screen: 0,
                 canvas_view: None,
@@ -2056,16 +2082,22 @@ impl ConfigEditor {
             ConfigRole::Agent => {
                 let controller_node = NodeId::new(self.controller_node.trim())
                     .map_err(|error| format!("Controller node: {error}"))?;
+                let display_size = Size::new(
+                    parse_nonzero("Agent screen width", &self.agent_width)?,
+                    parse_nonzero("Agent screen height", &self.agent_height)?,
+                );
+                let display_layout = if self.agent_layout.size() == display_size {
+                    self.agent_layout.clone()
+                } else {
+                    DesktopLayout::single(display_size)
+                };
                 Role::Agent {
                     controller_node,
                     controller: parse_socket_address(
                         "Controller address",
                         &self.controller_address,
                     )?,
-                    display_size: Size::new(
-                        parse_nonzero("Agent screen width", &self.agent_width)?,
-                        parse_nonzero("Agent screen height", &self.agent_height)?,
-                    ),
+                    display_layout,
                 }
             }
         };
@@ -2151,7 +2183,11 @@ impl ConfigEditor {
         let previous_origin = self.screens[index]
             .geometry()
             .map(|screen| (screen.x, screen.y));
-        self.resize_screen(index, geometry.size.width.get(), geometry.size.height.get());
+        self.resize_screen(
+            index,
+            geometry.size().width.get(),
+            geometry.size().height.get(),
+        );
         if let (Some((previous_x, previous_y)), Some(updated)) =
             (previous_origin, self.screens[index].geometry())
         {
@@ -2165,19 +2201,19 @@ impl ConfigEditor {
                 screen.y = saturating_i64_to_i32(i64::from(screen_geometry.y) + dy).to_string();
             }
         }
-        self.screens[index].monitor_count = geometry.monitor_count;
+        self.screens[index].layout = geometry.layout;
         self.selected_screen = index;
         self.canvas_view = None;
         Ok(())
     }
 
     fn set_agent_desktop(&mut self, geometry: platform::DesktopGeometry) {
-        self.agent_width = geometry.size.width.to_string();
-        self.agent_height = geometry.size.height.to_string();
-        self.agent_monitor_count = geometry.monitor_count;
+        self.agent_width = geometry.size().width.to_string();
+        self.agent_height = geometry.size().height.to_string();
+        self.agent_layout = geometry.layout;
     }
 
-    fn update_screen(&mut self, placement: &ScreenPlacement, monitor_count: u32) {
+    fn update_screen(&mut self, placement: &ScreenPlacement) {
         let Some((index, screen)) = self
             .screens
             .iter_mut()
@@ -2190,7 +2226,7 @@ impl ConfigEditor {
         screen.y = placement.bounds.origin.y.to_string();
         screen.width = placement.bounds.size.width.to_string();
         screen.height = placement.bounds.size.height.to_string();
-        screen.monitor_count = monitor_count;
+        screen.layout = placement.layout.clone();
         self.selected_screen = index;
         self.canvas_view = None;
     }
@@ -2463,7 +2499,7 @@ struct ScreenEditor {
     y: String,
     width: String,
     height: String,
-    monitor_count: u32,
+    layout: DesktopLayout,
 }
 
 impl ScreenEditor {
@@ -2478,7 +2514,10 @@ impl ScreenEditor {
             y: y.to_string(),
             width: String::from("1920"),
             height: String::from("1080"),
-            monitor_count: 1,
+            layout: DesktopLayout::single(Size::new(
+                NonZeroU32::new(1920).unwrap_or(NonZeroU32::MIN),
+                NonZeroU32::new(1080).unwrap_or(NonZeroU32::MIN),
+            )),
         }
     }
 
@@ -2489,7 +2528,7 @@ impl ScreenEditor {
             y: placement.bounds.origin.y.to_string(),
             width: placement.bounds.size.width.to_string(),
             height: placement.bounds.size.height.to_string(),
-            monitor_count: 1,
+            layout: placement.layout.clone(),
         }
     }
 
@@ -2509,10 +2548,14 @@ impl ScreenEditor {
             .map_err(|error| format!("Machine {number} Y: {error}"))?;
         let width = parse_nonzero(&format!("Machine {number} width"), &self.width)?;
         let height = parse_nonzero(&format!("Machine {number} height"), &self.height)?;
-        Ok(ScreenPlacement {
-            node,
-            bounds: Rect::new(Point { x, y }, Size::new(width, height)),
-        })
+        let size = Size::new(width, height);
+        let layout = if self.layout.size() == size {
+            self.layout.clone()
+        } else {
+            DesktopLayout::single(size)
+        };
+        ScreenPlacement::with_layout(node, Point { x, y }, layout)
+            .map_err(|error| format!("Machine {number}: {error}"))
     }
 
     fn geometry(&self) -> Option<ScreenGeometry> {
@@ -2606,7 +2649,7 @@ fn topology_canvas(ui: &mut Ui, editor: &mut ConfigEditor, local_node: Option<&N
             local_node.is_some_and(|node| editor.screens[index].node.trim() == node.as_str());
         paint_screen(
             &painter,
-            screen_rect.intersect(canvas),
+            screen_rect,
             &editor.screens[index],
             geometry,
             editor.selected_screen == index,
@@ -2647,6 +2690,32 @@ fn paint_screen(
         BORDER
     };
     painter.rect_filled(screen_rect, CornerRadius::same(4), ELEVATED);
+    let layout_width = screen.layout.size().width.get() as f32;
+    let layout_height = screen.layout.size().height.get() as f32;
+    for (index, monitor) in screen.layout.monitors().iter().enumerate() {
+        let bounds = monitor.bounds;
+        let monitor_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                screen_rect.left() + screen_rect.width() * bounds.origin.x as f32 / layout_width,
+                screen_rect.top() + screen_rect.height() * bounds.origin.y as f32 / layout_height,
+            ),
+            egui::pos2(
+                screen_rect.left() + screen_rect.width() * bounds.right() as f32 / layout_width,
+                screen_rect.top() + screen_rect.height() * bounds.bottom() as f32 / layout_height,
+            ),
+        );
+        painter.rect_filled(
+            monitor_rect.shrink(1.0),
+            CornerRadius::same(2),
+            if index % 2 == 0 { PANEL } else { CANVAS },
+        );
+        painter.rect_stroke(
+            monitor_rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0, BORDER),
+            egui::StrokeKind::Inside,
+        );
+    }
     painter.rect_stroke(
         screen_rect,
         CornerRadius::same(4),
@@ -2662,8 +2731,12 @@ fn paint_screen(
             "{}x{} | {} display{}",
             geometry.width,
             geometry.height,
-            screen.monitor_count,
-            if screen.monitor_count == 1 { "" } else { "s" }
+            screen.layout.monitor_count(),
+            if screen.layout.monitor_count() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ),
         screen_rect.width(),
         detail_size,
@@ -2683,6 +2756,15 @@ fn paint_screen(
         FontId::monospace(detail_size),
         MUTED,
     );
+}
+
+const fn rotation_label(rotation: DisplayRotation) -> &'static str {
+    match rotation {
+        DisplayRotation::Normal => "landscape",
+        DisplayRotation::Clockwise90 => "90 degrees",
+        DisplayRotation::Clockwise180 => "180 degrees",
+        DisplayRotation::Clockwise270 => "270 degrees",
+    }
 }
 
 fn canvas_label(value: &str, available_width: f32, font_size: f32) -> String {
@@ -2800,6 +2882,7 @@ fn desktop_geometry(frame: &eframe::Frame) -> Option<platform::DesktopGeometry> 
             y: position.y,
             width: size.width,
             height: size.height,
+            scale_milli: positive_scale_milli(monitor.scale_factor()),
         }
     }))
 }
@@ -2811,6 +2894,7 @@ struct MonitorGeometry {
     y: i32,
     width: u32,
     height: u32,
+    scale_milli: u32,
 }
 
 fn aggregate_monitor_geometry(
@@ -2832,13 +2916,38 @@ fn aggregate_monitor_geometry(
     }
     let width = u32::try_from(right.checked_sub(left)?).ok()?;
     let height = u32::try_from(bottom.checked_sub(top)?).ok()?;
+    let size = Size::new(NonZeroU32::new(width)?, NonZeroU32::new(height)?);
+    let layout = DesktopLayout::new(
+        size,
+        monitors
+            .into_iter()
+            .map(|monitor| {
+                let mut display = Monitor::new(
+                    monitor.name,
+                    Rect::new(
+                        Point {
+                            x: i32::try_from(i64::from(monitor.x) - left).ok()?,
+                            y: i32::try_from(i64::from(monitor.y) - top).ok()?,
+                        },
+                        Size::new(
+                            NonZeroU32::new(monitor.width)?,
+                            NonZeroU32::new(monitor.height)?,
+                        ),
+                    ),
+                );
+                display.scale_milli = NonZeroU32::new(monitor.scale_milli)?;
+                display.rotation = DisplayRotation::Normal;
+                Some(display)
+            })
+            .collect::<Option<Vec<_>>>()?,
+    )
+    .ok()?;
     Some(platform::DesktopGeometry {
         origin: Point {
             x: i32::try_from(left).ok()?,
             y: i32::try_from(top).ok()?,
         },
-        size: Size::new(NonZeroU32::new(width)?, NonZeroU32::new(height)?),
-        monitor_count: u32::try_from(monitors.len()).ok()?,
+        layout,
     })
 }
 
@@ -2847,19 +2956,29 @@ fn current_monitor_geometry(context: &egui::Context) -> Option<platform::Desktop
         let viewport = input.viewport();
         let size = viewport.monitor_size?;
         let scale = viewport.native_pixels_per_point.unwrap_or(1.0);
+        let size = Size::new(
+            NonZeroU32::new(positive_pixel_dimension(size.x * scale)?)?,
+            NonZeroU32::new(positive_pixel_dimension(size.y * scale)?)?,
+        );
+        let mut monitor = Monitor::new(None, Rect::new(Point { x: 0, y: 0 }, size));
+        monitor.scale_milli = NonZeroU32::new(positive_scale_milli(f64::from(scale)))?;
         Some(platform::DesktopGeometry {
             origin: Point { x: 0, y: 0 },
-            size: Size::new(
-                NonZeroU32::new(positive_pixel_dimension(size.x * scale)?)?,
-                NonZeroU32::new(positive_pixel_dimension(size.y * scale)?)?,
-            ),
-            monitor_count: 1,
+            layout: DesktopLayout::new(size, vec![monitor]).ok()?,
         })
     })
 }
 
 fn positive_pixel_dimension(value: f32) -> Option<u32> {
     (value.is_finite() && value >= 1.0 && value <= u32::MAX as f32).then(|| value.round() as u32)
+}
+
+fn positive_scale_milli(value: f64) -> u32 {
+    if value.is_finite() {
+        (value * 1000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32
+    } else {
+        1000
+    }
 }
 
 fn parse_socket_address(label: &str, value: &str) -> Result<SocketAddr, String> {
@@ -2947,7 +3066,7 @@ pub enum AppError {
 mod tests {
     use std::num::NonZeroU32;
 
-    use domain::{NodeId, Point, Rect, ScreenPlacement, Size};
+    use domain::{DesktopLayout, Monitor, NodeId, Point, Rect, ScreenPlacement, Size};
     use identity::IdentityStore;
     use tempfile::TempDir;
 
@@ -2955,6 +3074,39 @@ mod tests {
         ConfigEditor, ConfigRole, DesktopApp, MonitorGeometry, RemoteDisplay, RuntimeEvent,
         RuntimeRole, ScreenEditor, ScreenGeometry, SessionState, aggregate_monitor_geometry,
     };
+
+    fn horizontal_layout(width: u32, height: u32, monitor_count: u32) -> DesktopLayout {
+        let desktop_size = Size::new(
+            NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+            NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+        );
+        let monitor_width = width / monitor_count;
+        let monitors = (0..monitor_count)
+            .map(|index| {
+                let left = monitor_width * index;
+                let width = if index + 1 == monitor_count {
+                    width - left
+                } else {
+                    monitor_width
+                };
+                Monitor::new(
+                    Some(format!("Display {}", index + 1)),
+                    Rect::new(
+                        Point {
+                            x: i32::try_from(left).unwrap_or(i32::MAX),
+                            y: 0,
+                        },
+                        Size::new(
+                            NonZeroU32::new(width).unwrap_or(NonZeroU32::MIN),
+                            NonZeroU32::new(height).unwrap_or(NonZeroU32::MIN),
+                        ),
+                    ),
+                )
+            })
+            .collect();
+        DesktopLayout::new(desktop_size, monitors)
+            .unwrap_or_else(|error| panic!("test desktop layout should be valid: {error}"))
+    }
 
     #[test]
     fn desktop_geometry_deduplicates_wayland_output_handles() {
@@ -2964,6 +3116,7 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale_milli: 1000,
         };
         let geometry = aggregate_monitor_geometry([
             monitor("HDMI-A-1", 0),
@@ -2976,9 +3129,9 @@ mod tests {
         .unwrap_or_else(|| panic!("monitor geometry should aggregate"));
 
         assert_eq!(geometry.origin, Point { x: 0, y: 0 });
-        assert_eq!(geometry.size.width.get(), 5760);
-        assert_eq!(geometry.size.height.get(), 1080);
-        assert_eq!(geometry.monitor_count, 3);
+        assert_eq!(geometry.size().width.get(), 5760);
+        assert_eq!(geometry.size().height.get(), 1080);
+        assert_eq!(geometry.monitor_count(), 3);
     }
 
     #[test]
@@ -3088,11 +3241,7 @@ mod tests {
                 &local,
                 platform::DesktopGeometry {
                     origin: Point { x: 0, y: 0 },
-                    size: Size::new(
-                        NonZeroU32::new(5_760).unwrap_or(NonZeroU32::MIN),
-                        NonZeroU32::new(1_080).unwrap_or(NonZeroU32::MIN),
-                    ),
-                    monitor_count: 3,
+                    layout: horizontal_layout(5_760, 1_080, 3),
                 },
             )
             .unwrap_or_else(|error| panic!("monitor dimensions should apply: {error}"));
@@ -3107,7 +3256,7 @@ mod tests {
                 height: 1_080,
             })
         );
-        assert_eq!(editor.screens[0].monitor_count, 3);
+        assert_eq!(editor.screens[0].layout.monitor_count(), 3);
     }
 
     #[test]
@@ -3124,11 +3273,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("desktop initialization failed: {error}"));
         let geometry = platform::DesktopGeometry {
             origin: Point { x: 0, y: 0 },
-            size: Size::new(
-                NonZeroU32::new(5_760).unwrap_or(NonZeroU32::MIN),
-                NonZeroU32::new(1_080).unwrap_or(NonZeroU32::MIN),
-            ),
-            monitor_count: 3,
+            layout: horizontal_layout(5_760, 1_080, 3),
         };
 
         app.config_editor.role = ConfigRole::Agent;
@@ -3137,7 +3282,7 @@ mod tests {
 
         assert_eq!(app.config_editor.agent_width, "5760");
         assert_eq!(app.config_editor.agent_height, "1080");
-        assert_eq!(app.config_editor.agent_monitor_count, 3);
+        assert_eq!(app.config_editor.agent_layout.monitor_count(), 3);
     }
 
     #[test]
@@ -3148,22 +3293,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
         let mut editor = ConfigEditor::for_node(Some(&local));
         editor.add_screen(remote.to_string());
-        let screen = ScreenPlacement {
-            node: remote.clone(),
-            bounds: Rect::new(
-                Point { x: 1920, y: -180 },
-                Size::new(
-                    NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
-                    NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
-                ),
-            ),
-        };
+        let screen = ScreenPlacement::with_layout(
+            remote.clone(),
+            Point { x: 1920, y: -180 },
+            horizontal_layout(2560, 1440, 2),
+        )
+        .unwrap_or_else(|error| panic!("screen layout should be valid: {error}"));
         let mut state = SessionState::default();
 
-        editor.update_screen(&screen, 2);
+        editor.update_screen(&screen);
         state.apply(RuntimeEvent::DisplayChanged {
             screen: screen.clone(),
-            monitor_count: 2,
         });
 
         assert_eq!(
@@ -3183,7 +3323,7 @@ mod tests {
                 height: 1440,
             })
         );
-        assert_eq!(editor.screens[1].monitor_count, 2);
+        assert_eq!(editor.screens[1].layout.monitor_count(), 2);
     }
 
     #[test]
@@ -3239,7 +3379,7 @@ mod tests {
             y: String::from("0"),
             width: String::from("0"),
             height: String::from("1080"),
-            monitor_count: 1,
+            layout: horizontal_layout(1920, 1080, 1),
         };
 
         assert_eq!(screen.geometry(), None);

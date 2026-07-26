@@ -156,11 +156,10 @@ mod tests {
     #[test]
     fn round_trips_a_display_change() {
         let message = Envelope::Session(Session::DisplayChanged {
-            size: Size::new(
+            layout: domain::DesktopLayout::single(Size::new(
                 NonZeroU32::new(2560).unwrap_or(NonZeroU32::MIN),
                 NonZeroU32::new(1440).unwrap_or(NonZeroU32::MIN),
-            ),
-            monitor_count: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+            )),
         });
         let codec = FrameCodec::default();
         let mut frame = codec

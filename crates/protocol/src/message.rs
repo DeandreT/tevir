@@ -1,12 +1,12 @@
 use std::num::NonZeroU32;
 
-use domain::{HostPlatform, InputEvent, NodeId, Point, Size};
+use domain::{DesktopLayout, HostPlatform, InputEvent, NodeId, Point};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ClipboardControl, ClipboardError};
 
-pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 pub const MAX_INPUT_EVENTS_PER_BATCH: usize = 512;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,8 +94,7 @@ pub struct InputBatch {
 #[serde(rename_all = "snake_case")]
 pub enum Session {
     DisplayChanged {
-        size: Size,
-        monitor_count: NonZeroU32,
+        layout: DesktopLayout,
     },
     FocusChanged {
         focus_epoch: u64,
@@ -140,8 +139,10 @@ impl Envelope {
                     }
                 }
                 Session::Clipboard(ClipboardControl::Offered(offer)) => offer.validate()?,
-                Session::DisplayChanged { .. }
-                | Session::FocusChanged { .. }
+                Session::DisplayChanged { layout } => {
+                    layout.validate()?;
+                }
+                Session::FocusChanged { .. }
                 | Session::InputAcknowledged { .. }
                 | Session::Heartbeat { .. }
                 | Session::HeartbeatAcknowledged { .. }
@@ -162,6 +163,8 @@ pub enum MessageValidationError {
     TooManyInputEvents { actual: usize, maximum: usize },
     #[error(transparent)]
     InvalidClipboard(#[from] ClipboardError),
+    #[error(transparent)]
+    InvalidDesktop(#[from] domain::DesktopLayoutError),
 }
 
 #[cfg(test)]
@@ -171,8 +174,8 @@ mod tests {
     #[test]
     fn compatibility_requires_the_exact_current_version() {
         assert!(CURRENT_PROTOCOL.is_current());
-        assert!(!ProtocolVersion { major: 1, minor: 4 }.is_current());
-        assert!(!ProtocolVersion { major: 1, minor: 2 }.is_current());
+        assert!(!ProtocolVersion { major: 1, minor: 5 }.is_current());
+        assert!(!ProtocolVersion { major: 1, minor: 3 }.is_current());
     }
 
     #[test]
