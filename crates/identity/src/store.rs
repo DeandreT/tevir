@@ -98,6 +98,7 @@ impl IdentityStore {
     }
 }
 
+#[derive(Clone)]
 pub struct TrustStore {
     directory: PathBuf,
     peers: BTreeMap<NodeId, TrustedPeer>,

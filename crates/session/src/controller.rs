@@ -180,6 +180,26 @@ impl ControllerSession {
         Ok(original - delivery.pending.len())
     }
 
+    pub fn reset_peer(&mut self, peer: &NodeId) -> Result<(), ControllerError> {
+        let delivery = self
+            .deliveries
+            .get_mut(peer)
+            .ok_or_else(|| ControllerError::UnknownPeer(peer.clone()))?;
+        *delivery = PeerDelivery::default();
+        Ok(())
+    }
+
+    pub fn return_to_local(&mut self) -> Result<Vec<ControllerAction>, ControllerError> {
+        if self.focus == self.local_node {
+            return Ok(Vec::new());
+        }
+        let local_screen = self
+            .topology
+            .screen(&self.local_node)
+            .ok_or_else(|| ControllerError::LocalNodeMissing(self.local_node.clone()))?;
+        self.change_focus(self.local_node.clone(), screen_center(local_screen), None)
+    }
+
     pub fn reconcile_topology(
         &mut self,
         topology: Topology,
@@ -645,6 +665,51 @@ mod tests {
             controller.acknowledge(&node("right"), 2),
             Err(ControllerError::AcknowledgementBeyondSent { .. })
         ));
+    }
+
+    #[test]
+    fn reconnect_resets_peer_delivery_sequences() {
+        let mut controller = ControllerSession::new(topology(), node("left"))
+            .unwrap_or_else(|error| panic!("controller creation failed: {error}"));
+        controller
+            .activate(Edge::Right, 540)
+            .unwrap_or_else(|error| panic!("activation failed: {error}"));
+        controller
+            .route_input(relative(1, 5, 5))
+            .and_then(|_| controller.flush())
+            .unwrap_or_else(|error| panic!("first delivery failed: {error}"));
+
+        controller
+            .reset_peer(&node("right"))
+            .unwrap_or_else(|error| panic!("peer reset failed: {error}"));
+        let actions = controller
+            .route_input(relative(2, 5, 5))
+            .and_then(|_| controller.flush())
+            .unwrap_or_else(|error| panic!("delivery after reconnect failed: {error}"));
+
+        assert!(matches!(
+            actions.as_slice(),
+            [ControllerAction::Send {
+                message: Session::Input(batch),
+                ..
+            }] if batch.sequence == 1
+        ));
+    }
+
+    #[test]
+    fn disconnecting_the_focused_peer_returns_focus_locally() {
+        let mut controller = ControllerSession::new(topology(), node("left"))
+            .unwrap_or_else(|error| panic!("controller creation failed: {error}"));
+        controller
+            .activate(Edge::Right, 540)
+            .unwrap_or_else(|error| panic!("activation failed: {error}"));
+
+        let actions = controller
+            .return_to_local()
+            .unwrap_or_else(|error| panic!("focus release failed: {error}"));
+
+        assert_eq!(controller.focus(), &node("left"));
+        assert!(actions.contains(&ControllerAction::ReleaseCapture));
     }
 
     #[test]

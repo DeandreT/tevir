@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod runtime;
 mod settings;
 
 use std::{path::PathBuf, process::ExitCode};

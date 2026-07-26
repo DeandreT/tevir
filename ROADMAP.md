@@ -56,6 +56,8 @@
 
 - [x] Add a native configuration and pairing UI backed by the same validated
   application commands as the CLI.
-- Add tray status, reconnect controls, logs, and actionable permission errors.
+- [x] Start saved sessions and expose authenticated connection, native backend,
+  and focus state in the desktop UI.
+- Add tray status and actionable permission recovery.
 - Package user-session startup for Windows and Linux Wayland.
 - Add upgrade, recovery, soak, and end-to-end multi-node tests.

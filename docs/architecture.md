@@ -15,7 +15,7 @@ behavior.
 ## Dependency Direction
 
 ```text
-tevir     -> discovery, domain, identity, platform, protocol, telemetry
+tevir     -> discovery, domain, identity, platform, protocol, session, telemetry, transport
 discovery -> domain, identity, protocol
 transport -> domain, identity, protocol
 session   -> domain, protocol
@@ -41,7 +41,9 @@ from an independent channel.
 
 The desktop surface uses `eframe` and `egui`. Its pairing and validation
 actions call the same identity and configuration boundaries as non-graphical
-commands. Linux builds enable only eframe's Wayland window backend.
+commands. A bounded background runtime owns the authenticated connections and
+native input services, while the GUI consumes lifecycle, connection, and focus
+events. Linux builds enable only eframe's Wayland window backend.
 
 Native handles, portal objects, Windows messages, and operating-system key
 codes must remain inside `platform`. Wire DTOs must remain inside `protocol`.

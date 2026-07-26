@@ -39,7 +39,9 @@ cargo run -p tevir -- doctor --json
 
 The desktop control surface creates the local node identity, finds nearby nodes,
 manages explicit peer pairing, creates validated controller or agent
-configurations, and reports native input prerequisites.
+configurations, starts saved sessions, and reports live connection and control
+state. Pairing trust is stored with the node identity; verification is required
+again only after the trusted node is removed or its identity changes.
 
 Validate one of the portable example configurations:
 

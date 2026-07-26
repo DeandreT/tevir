@@ -90,6 +90,8 @@ pub enum BackendError {
     },
     #[error("backend command queue is full")]
     CommandQueueFull,
+    #[error("native input batch cannot be empty")]
+    EmptyInputBatch,
     #[error("backend worker has stopped")]
     WorkerStopped,
     #[error("backend worker thread panicked")]

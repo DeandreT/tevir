@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -18,6 +19,7 @@ use telemetry::{LogBuffer, LogEntry, LogLevel};
 
 use crate::{
     config::{Config, Role},
+    runtime::{RuntimeEvent, RuntimeRole, SessionRuntime},
     settings::{DesktopSettings, SettingsError},
 };
 
@@ -66,6 +68,9 @@ pub struct DesktopApp {
     pairing_code_input: String,
     config_path_input: String,
     config_editor: ConfigEditor,
+    saved_config: Option<Config>,
+    session_runtime: Option<SessionRuntime>,
+    session_state: SessionState,
     report: PlatformReport,
     notice: Option<Notice>,
     config_summary: Option<String>,
@@ -128,6 +133,9 @@ impl DesktopApp {
             pairing_code_input: String::new(),
             config_path_input,
             config_editor,
+            saved_config: None,
+            session_runtime: None,
+            session_state: SessionState::default(),
             report,
             notice,
             config_summary: None,
@@ -161,6 +169,8 @@ impl DesktopApp {
                 self.identity = Some(identity);
                 self.trust = Some(trust);
                 self.config_editor = ConfigEditor::for_node(Some(&node));
+                self.stop_session();
+                self.saved_config = None;
                 self.start_discovery();
                 tracing::info!(node = %node, "local identity ready");
                 self.notice = Some(Notice::success("Local identity ready"));
@@ -239,6 +249,12 @@ impl DesktopApp {
                     self.use_discovered_controller_address();
                 }
                 self.notice = Some(Notice::success(format!("Paired with {node}")));
+                if (self.session_runtime.is_some()
+                    || self.session_state.phase == SessionPhase::Failed)
+                    && let Some(config) = self.saved_config.clone()
+                {
+                    self.start_session(config);
+                }
             }
             Err(error) => {
                 tracing::warn!(peer = %node, error = %error, "peer trust rejected");
@@ -254,6 +270,7 @@ impl DesktopApp {
         match trust.remove(node) {
             Ok(true) => {
                 tracing::info!(peer = %node, "peer trust removed");
+                self.stop_session();
                 self.notice = Some(Notice::success(format!("Removed {node}")));
             }
             Ok(false) => {
@@ -292,13 +309,16 @@ impl DesktopApp {
                 }
                 self.config_editor = ConfigEditor::from_config(&config);
                 self.config_summary = Some(config_summary(&config));
+                self.saved_config = Some(config.clone());
                 self.remember_config_path(&path);
                 self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration loaded");
                 self.notice = Some(Notice::success("Configuration loaded"));
+                self.start_session(config);
             }
             Err(error) => {
                 self.config_summary = None;
+                self.saved_config = None;
                 tracing::warn!(path = %path.display(), error = %error, "configuration load failed");
                 self.notice = Some(Notice::error(error.to_string()));
             }
@@ -326,10 +346,12 @@ impl DesktopApp {
         match config.save(&path) {
             Ok(()) => {
                 self.config_summary = Some(config_summary(&config));
+                self.saved_config = Some(config.clone());
                 self.remember_config_path(&path);
                 self.start_discovery();
                 tracing::info!(path = %path.display(), "configuration saved");
                 self.notice = Some(Notice::success("Configuration saved"));
+                self.start_session(config);
             }
             Err(error) => {
                 tracing::error!(path = %path.display(), error = %error, "configuration save failed");
@@ -342,6 +364,83 @@ impl DesktopApp {
         self.settings.config_path = Some(path.to_path_buf());
         if let Err(error) = self.settings.save(&self.data_directory) {
             tracing::warn!(error = %error, "could not remember configuration path");
+        }
+    }
+
+    fn start_session(&mut self, config: Config) {
+        self.stop_session();
+        if !self.report.is_available() {
+            self.notice = Some(Notice::error(
+                "Native desktop input prerequisites are unavailable",
+            ));
+            return;
+        }
+        let Some(identity) = self.identity.clone() else {
+            self.notice = Some(Notice::error("Local identity is not ready"));
+            return;
+        };
+        let Some(trust) = self.trust.clone() else {
+            self.notice = Some(Notice::error("Trust store is not ready"));
+            return;
+        };
+        match SessionRuntime::start(config, identity, trust) {
+            Ok(runtime) => {
+                self.session_state = SessionState::default();
+                self.session_runtime = Some(runtime);
+                self.notice = Some(Notice::info("Session starting"));
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "session start rejected");
+                self.session_state.record_error(error.to_string());
+                self.notice = Some(Notice::error(error.to_string()));
+            }
+        }
+    }
+
+    fn stop_session(&mut self) {
+        if let Some(runtime) = self.session_runtime.take() {
+            runtime.stop();
+        }
+        self.session_state.stop();
+    }
+
+    fn poll_session(&mut self) {
+        let mut stopped = false;
+        if let Some(runtime) = self.session_runtime.as_ref() {
+            while let Ok(event) = runtime.try_recv() {
+                match &event {
+                    RuntimeEvent::Connected { peer, .. } => {
+                        self.notice = Some(Notice::success(format!("Connected to {peer}")));
+                    }
+                    RuntimeEvent::AgentControl {
+                        controller,
+                        active: true,
+                    } => {
+                        self.notice = Some(Notice::info(format!("Controlled by {controller}")));
+                    }
+                    RuntimeEvent::FocusChanged { node }
+                        if self.session_state.connected.contains_key(node) =>
+                    {
+                        self.notice = Some(Notice::info(format!("Controlling {node}")));
+                    }
+                    RuntimeEvent::Error { message } => {
+                        self.notice = Some(Notice::error(message));
+                    }
+                    RuntimeEvent::Starting { .. }
+                    | RuntimeEvent::Listening { .. }
+                    | RuntimeEvent::Connecting { .. }
+                    | RuntimeEvent::Disconnected { .. }
+                    | RuntimeEvent::NativeReady { .. }
+                    | RuntimeEvent::FocusChanged { .. }
+                    | RuntimeEvent::AgentControl { .. }
+                    | RuntimeEvent::Stopped => {}
+                }
+                stopped |= matches!(event, RuntimeEvent::Stopped);
+                self.session_state.apply(event);
+            }
+        }
+        if stopped && let Some(runtime) = self.session_runtime.take() {
+            runtime.stop();
         }
     }
 
@@ -437,7 +536,7 @@ impl DesktopApp {
                         Page::Logs => "Logs",
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let ready = self.report.is_available() && self.peer_count() > 0;
+                        let ready = self.session_state.is_ready();
                         status_label(
                             ui,
                             if ready { "Ready" } else { "Setup required" },
@@ -471,6 +570,122 @@ impl DesktopApp {
     }
 
     fn status_view(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            section_heading(ui, "Live session", self.session_state.role_label());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.session_runtime.is_some() {
+                    if ui
+                        .add_sized([112.0, 34.0], Button::new("Stop session"))
+                        .clicked()
+                    {
+                        self.stop_session();
+                        self.notice = Some(Notice::info("Session stopped"));
+                    }
+                } else if ui
+                    .add_enabled(
+                        self.saved_config.is_some(),
+                        Button::new("Start session").min_size(Vec2::new(112.0, 34.0)),
+                    )
+                    .clicked()
+                    && let Some(config) = self.saved_config.clone()
+                {
+                    self.start_session(config);
+                }
+            });
+        });
+        ui.add_space(14.0);
+        let (state_label, state_color) = self.session_state.status();
+        metric_row(ui, "State", state_label, state_color);
+        metric_row(
+            ui,
+            "Native input",
+            if self.session_state.native_ready {
+                "Ready"
+            } else {
+                "Waiting"
+            },
+            if self.session_state.native_ready {
+                SUCCESS
+            } else {
+                WARNING
+            },
+        );
+        match self.session_state.role {
+            Some(RuntimeRole::Controller) => {
+                metric_row(
+                    ui,
+                    "Connected agents",
+                    &self.session_state.connected.len().to_string(),
+                    if self.session_state.connected.is_empty() {
+                        WARNING
+                    } else {
+                        SUCCESS
+                    },
+                );
+                metric_row(
+                    ui,
+                    "Control target",
+                    if self.session_state.is_controlling_remote() {
+                        self.session_state
+                            .focus
+                            .as_ref()
+                            .map_or("Local desktop", NodeId::as_str)
+                    } else {
+                        "Local desktop"
+                    },
+                    if self.session_state.is_controlling_remote() {
+                        ACCENT
+                    } else {
+                        TEXT
+                    },
+                );
+                for peer in self.session_state.connected.keys() {
+                    metric_row(ui, "Agent", peer.as_str(), SUCCESS);
+                }
+            }
+            Some(RuntimeRole::Agent) => {
+                let controlled = self.session_state.agent_controlled;
+                metric_row(
+                    ui,
+                    "Controller",
+                    self.session_state
+                        .connected
+                        .keys()
+                        .next()
+                        .map_or("Not connected", NodeId::as_str),
+                    if self.session_state.connected.is_empty() {
+                        WARNING
+                    } else {
+                        SUCCESS
+                    },
+                );
+                metric_row(
+                    ui,
+                    "Remote input",
+                    if controlled {
+                        "Being controlled"
+                    } else if self.session_state.connected.is_empty() {
+                        "Disconnected"
+                    } else {
+                        "Connected, idle"
+                    },
+                    if controlled {
+                        ACCENT
+                    } else if self.session_state.connected.is_empty() {
+                        WARNING
+                    } else {
+                        SUCCESS
+                    },
+                );
+            }
+            None => {}
+        }
+        if let Some(error) = self.session_state.last_error.as_ref() {
+            ui.add_space(8.0);
+            status_label(ui, error, DANGER);
+        }
+
+        ui.add_space(30.0);
         section_heading(
             ui,
             "Session readiness",
@@ -508,7 +723,20 @@ impl DesktopApp {
                 DANGER
             },
         );
-        metric_row(ui, "Transport", "TLS 1.3 / QUIC", ACCENT);
+        metric_row(
+            ui,
+            "Secure transport",
+            if self.session_state.connected.is_empty() {
+                "Disconnected"
+            } else {
+                "Authenticated"
+            },
+            if self.session_state.connected.is_empty() {
+                WARNING
+            } else {
+                SUCCESS
+            },
+        );
 
         ui.add_space(30.0);
         section_heading(ui, "Configuration", "Controller or agent");
@@ -1072,6 +1300,7 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.poll_discovery();
+        self.poll_session();
         if self.identity.is_none() {
             self.setup_view(ui);
             return;
@@ -1079,11 +1308,14 @@ impl eframe::App for DesktopApp {
         self.navigation(ui);
         self.top_bar(ui);
         self.content(ui);
-        ui.ctx().request_repaint_after(if self.page == Page::Logs {
-            Duration::from_millis(500)
-        } else {
-            Duration::from_secs(1)
-        });
+        ui.ctx()
+            .request_repaint_after(if self.session_runtime.is_some() {
+                Duration::from_millis(50)
+            } else if self.page == Page::Logs {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(1)
+            });
     }
 }
 
@@ -1350,6 +1582,133 @@ fn initial_page() -> Page {
 #[cfg(not(feature = "screenshot-tests"))]
 const fn initial_page() -> Page {
     Page::Status
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SessionPhase {
+    #[default]
+    Stopped,
+    Starting,
+    Listening,
+    Connecting,
+    Connected,
+    Failed,
+}
+
+#[derive(Default)]
+struct SessionState {
+    phase: SessionPhase,
+    role: Option<RuntimeRole>,
+    connected: BTreeMap<NodeId, u128>,
+    focus: Option<NodeId>,
+    agent_controlled: bool,
+    native_ready: bool,
+    last_error: Option<String>,
+}
+
+impl SessionState {
+    fn apply(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::Starting { role } => {
+                self.phase = SessionPhase::Starting;
+                self.role = Some(role);
+                self.connected.clear();
+                self.focus = None;
+                self.agent_controlled = false;
+                self.native_ready = false;
+                self.last_error = None;
+            }
+            RuntimeEvent::Listening { address } => {
+                tracing::info!(%address, "session listening");
+                self.phase = SessionPhase::Listening;
+            }
+            RuntimeEvent::Connecting {
+                peer,
+                address,
+                attempt,
+            } => {
+                tracing::info!(%peer, %address, attempt, "session connecting");
+                self.phase = SessionPhase::Connecting;
+            }
+            RuntimeEvent::Connected { peer, session_id } => {
+                self.connected.insert(peer, session_id);
+                self.phase = SessionPhase::Connected;
+                self.last_error = None;
+            }
+            RuntimeEvent::Disconnected { peer, reason } => {
+                self.connected.remove(&peer);
+                self.agent_controlled = false;
+                self.last_error = Some(format!("{peer}: {reason}"));
+                self.phase = match self.role {
+                    Some(RuntimeRole::Controller) => SessionPhase::Listening,
+                    Some(RuntimeRole::Agent) => SessionPhase::Connecting,
+                    None => SessionPhase::Stopped,
+                };
+            }
+            RuntimeEvent::NativeReady { backend } => {
+                tracing::info!(?backend, "native session backend ready");
+                self.native_ready = true;
+            }
+            RuntimeEvent::FocusChanged { node } => {
+                self.focus = Some(node);
+            }
+            RuntimeEvent::AgentControl { controller, active } => {
+                tracing::info!(%controller, active, "agent control state changed");
+                self.agent_controlled = active;
+            }
+            RuntimeEvent::Error { message } => self.record_error(message),
+            RuntimeEvent::Stopped => {
+                self.connected.clear();
+                self.agent_controlled = false;
+                self.native_ready = false;
+                self.phase = if self.last_error.is_some() {
+                    SessionPhase::Failed
+                } else {
+                    SessionPhase::Stopped
+                };
+            }
+        }
+    }
+
+    fn record_error(&mut self, message: String) {
+        self.last_error = Some(message);
+        if self.phase == SessionPhase::Stopped {
+            self.phase = SessionPhase::Failed;
+        }
+    }
+
+    fn stop(&mut self) {
+        *self = Self::default();
+    }
+
+    const fn role_label(&self) -> &'static str {
+        match self.role {
+            Some(RuntimeRole::Controller) => "Controller",
+            Some(RuntimeRole::Agent) => "Agent",
+            None => "Not running",
+        }
+    }
+
+    const fn status(&self) -> (&'static str, Color32) {
+        match self.phase {
+            SessionPhase::Stopped => ("Stopped", MUTED),
+            SessionPhase::Starting => ("Starting", WARNING),
+            SessionPhase::Listening => ("Listening", ACCENT),
+            SessionPhase::Connecting => ("Connecting", WARNING),
+            SessionPhase::Connected => ("Connected", SUCCESS),
+            SessionPhase::Failed => ("Failed", DANGER),
+        }
+    }
+
+    fn is_controlling_remote(&self) -> bool {
+        self.focus
+            .as_ref()
+            .is_some_and(|focus| self.connected.contains_key(focus))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.native_ready && !self.connected.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2014,7 +2373,10 @@ mod tests {
     use identity::IdentityStore;
     use tempfile::TempDir;
 
-    use super::{ConfigEditor, ConfigRole, DesktopApp, ScreenEditor, ScreenGeometry};
+    use super::{
+        ConfigEditor, ConfigRole, DesktopApp, RuntimeEvent, RuntimeRole, ScreenEditor,
+        ScreenGeometry, SessionState,
+    };
 
     #[test]
     fn node_override_initializes_the_desktop_identity() {
@@ -2169,5 +2531,27 @@ mod tests {
         };
 
         assert_eq!(screen.geometry(), None);
+    }
+
+    #[test]
+    fn live_status_distinguishes_connection_and_remote_focus() {
+        let remote = NodeId::new("studio-right")
+            .unwrap_or_else(|error| panic!("test node should be valid: {error}"));
+        let mut state = SessionState::default();
+        state.apply(RuntimeEvent::Starting {
+            role: RuntimeRole::Controller,
+        });
+        state.apply(RuntimeEvent::NativeReady {
+            backend: platform::BackendKind::WindowsHooks,
+        });
+        state.apply(RuntimeEvent::Connected {
+            peer: remote.clone(),
+            session_id: 42,
+        });
+        state.apply(RuntimeEvent::FocusChanged { node: remote });
+
+        assert!(state.is_ready());
+        assert!(state.is_controlling_remote());
+        assert_eq!(state.status().0, "Connected");
     }
 }

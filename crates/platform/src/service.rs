@@ -53,6 +53,9 @@ pub enum InjectionServiceEvent {
     Ready {
         backend: BackendKind,
     },
+    Applied {
+        sequence: u64,
+    },
     Released,
     Failed {
         operation: &'static str,
@@ -66,7 +69,10 @@ enum CaptureCommand {
 }
 
 enum InjectionCommand {
-    Inject(InputEvent),
+    ApplyBatch {
+        sequence: u64,
+        events: Vec<InputEvent>,
+    },
     ReleaseAll,
 }
 
@@ -181,8 +187,11 @@ impl InjectionService {
         })
     }
 
-    pub fn inject(&self, event: InputEvent) -> Result<(), BackendError> {
-        self.send(InjectionCommand::Inject(event))
+    pub fn apply_batch(&self, sequence: u64, events: Vec<InputEvent>) -> Result<(), BackendError> {
+        if events.is_empty() {
+            return Err(BackendError::EmptyInputBatch);
+        }
+        self.send(InjectionCommand::ApplyBatch { sequence, events })
     }
 
     pub fn release_all(&self) -> Result<(), BackendError> {
@@ -400,18 +409,37 @@ async fn run_injection(
     );
 
     let mut held = HeldInput::default();
-    while let Some(command) = commands.recv().await {
+    'commands: while let Some(command) = commands.recv().await {
         match command {
-            InjectionCommand::Inject(event) => match to_native(event) {
-                Ok(native) => {
-                    if let Err(error) = injection.consume(native, ENGINE_HANDLE).await {
-                        send_injection_failure(&events, "inject input", &error);
-                    } else {
-                        held.observe(event);
+            InjectionCommand::ApplyBatch {
+                sequence,
+                events: batch,
+            } => {
+                let mut applied = true;
+                for event in batch {
+                    match to_native(event) {
+                        Ok(native) => {
+                            if let Err(error) = injection.consume(native, ENGINE_HANDLE).await {
+                                send_injection_failure(&events, "inject input", &error);
+                                applied = false;
+                            } else {
+                                held.observe(event);
+                            }
+                        }
+                        Err(error) => {
+                            send_injection_failure(&events, "normalize remote input", &error);
+                            applied = false;
+                        }
                     }
                 }
-                Err(error) => send_injection_failure(&events, "normalize remote input", &error),
-            },
+                if applied
+                    && events
+                        .send(InjectionServiceEvent::Applied { sequence })
+                        .is_err()
+                {
+                    break 'commands;
+                }
+            }
             InjectionCommand::ReleaseAll => {
                 release_injected_input(&mut injection, &events, &mut held).await;
             }
