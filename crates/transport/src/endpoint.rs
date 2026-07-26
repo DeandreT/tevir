@@ -407,6 +407,24 @@ impl PeerConnection {
         }
     }
 
+    #[must_use]
+    pub fn split_control(self) -> (ControlSender, ControlReceiver) {
+        (
+            ControlSender {
+                connection: self.connection,
+                info: self.info,
+                send: self.send,
+                maximum_frame_bytes: self.maximum_control_frame_bytes,
+                operation_timeout: self.operation_timeout,
+            },
+            ControlReceiver {
+                receive: self.receive,
+                maximum_frame_bytes: self.maximum_control_frame_bytes,
+                operation_timeout: self.operation_timeout,
+            },
+        )
+    }
+
     pub async fn open_clipboard(&self) -> Result<ClipboardStream, TransportError> {
         let (mut send, receive) =
             operation(self.operation_timeout, "opening clipboard stream", async {
@@ -457,6 +475,52 @@ impl PeerConnection {
 
     pub async fn closed(&self) {
         let _reason = self.connection.closed().await;
+    }
+}
+
+pub struct ControlSender {
+    connection: Connection,
+    info: ConnectionInfo,
+    send: SendStream,
+    maximum_frame_bytes: usize,
+    operation_timeout: Duration,
+}
+
+impl ControlSender {
+    pub async fn send(&mut self, message: Session) -> Result<(), TransportError> {
+        write_control_with_timeout(
+            &mut self.send,
+            &Envelope::Session(message),
+            self.maximum_frame_bytes,
+            self.operation_timeout,
+        )
+        .await
+    }
+
+    pub fn close(&self) {
+        tracing::info!(peer = %self.info.peer, session_id = self.info.session_id, "closing peer session");
+        self.connection.close(VarInt::from_u32(0), b"closed");
+    }
+}
+
+pub struct ControlReceiver {
+    receive: RecvStream,
+    maximum_frame_bytes: usize,
+    operation_timeout: Duration,
+}
+
+impl ControlReceiver {
+    pub async fn receive(&mut self) -> Result<Session, TransportError> {
+        match read_control_with_timeout(
+            &mut self.receive,
+            self.maximum_frame_bytes,
+            self.operation_timeout,
+        )
+        .await?
+        {
+            Envelope::Session(message) => Ok(message),
+            Envelope::Handshake(_) => Err(TransportError::UnexpectedHandshake),
+        }
     }
 }
 

@@ -16,8 +16,8 @@ use session::{AgentAction, AgentSession, ControllerAction, ControllerSession};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 use transport::{
-    PeerConnection, ReconnectPolicy, SecureClient, SecureServer, SessionLimits, SessionProfile,
-    TransportError,
+    ControlReceiver, ControlSender, PeerConnection, ReconnectPolicy, SecureClient, SecureServer,
+    SessionLimits, SessionProfile, TransportError,
 };
 
 use crate::config::{Config, Role};
@@ -661,7 +661,7 @@ async fn run_agent(
             connected = client.connect(&controller_node, controller_address) => connected,
         };
         match connection {
-            Ok(mut connection) => {
+            Ok(connection) => {
                 attempt = 0;
                 let info = connection.info().clone();
                 send_event(
@@ -676,12 +676,11 @@ async fn run_agent(
                     &controller_node,
                     display_size,
                     &injection,
-                    &mut connection,
+                    connection,
                     &mut commands,
                     &events,
                 )
                 .await?;
-                connection.close();
                 if outcome == AgentConnectionOutcome::Stopped {
                     break;
                 }
@@ -727,31 +726,39 @@ async fn run_agent_connection(
     controller_node: &NodeId,
     display_size: domain::Size,
     injection: &InjectionService,
-    connection: &mut PeerConnection,
+    connection: PeerConnection,
     commands: &mut tokio_mpsc::Receiver<RuntimeCommand>,
     events: &SyncSender<RuntimeEvent>,
 ) -> Result<AgentConnectionOutcome, RuntimeError> {
+    let (mut sender, receiver) = connection.split_control();
+    let (mut inbound, reader_worker) = spawn_control_reader(receiver);
     let mut agent = AgentSession::new(local_node.clone(), display_size);
     let mut input_tick = tokio::time::interval(INPUT_POLL_INTERVAL);
     input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut controlled = false;
     let mut application_pending = false;
 
-    loop {
-        tokio::select! {
+    let outcome = async {
+        'session: loop {
+            tokio::select! {
             command = commands.recv() => {
                 if command.is_none() || matches!(command, Some(RuntimeCommand::Stop)) {
-                    let _ = connection.send(Session::Disconnect).await;
+                    let _ = sender.send(Session::Disconnect).await;
                     let _ = injection.release_all();
-                    return Ok(AgentConnectionOutcome::Stopped);
+                    break Ok(AgentConnectionOutcome::Stopped);
                 }
             }
-            message = connection.receive(), if !application_pending => {
-                let message = match message {
-                    Ok(message) => message,
-                    Err(_) => {
+            inbound_event = inbound.recv(), if !application_pending => {
+                let message = match inbound_event {
+                    Some(ControlReadEvent::Message(message)) => message,
+                    Some(ControlReadEvent::Disconnected(reason)) => {
+                        tracing::warn!(%reason, "agent control connection ended");
                         let _ = injection.release_all();
-                        return Ok(AgentConnectionOutcome::Disconnected);
+                        break Ok(AgentConnectionOutcome::Disconnected);
+                    }
+                    None => {
+                        let _ = injection.release_all();
+                        break Ok(AgentConnectionOutcome::Disconnected);
                     }
                 };
                 let actions = agent
@@ -760,7 +767,7 @@ async fn run_agent_connection(
                 application_pending = actions
                     .iter()
                     .any(|action| matches!(action, AgentAction::ApplyInput(_)));
-                apply_agent_actions(actions, injection, connection).await?;
+                apply_agent_actions(actions, injection, &mut sender).await?;
                 let next_controlled = agent.active_focus_epoch().is_some();
                 if next_controlled != controlled {
                     controlled = next_controlled;
@@ -781,28 +788,35 @@ async fn run_agent_connection(
                             let actions = agent
                                 .confirm_applied(sequence)
                                 .map_err(|error| RuntimeError::Session(error.to_string()))?;
-                            apply_agent_actions(actions, injection, connection).await?;
+                            apply_agent_actions(actions, injection, &mut sender).await?;
                         }
                         InjectionServiceEvent::Released => {}
                         InjectionServiceEvent::Failed { operation, reason } => {
-                            return Err(RuntimeError::Native(format!("{operation}: {reason}")));
+                            break 'session Err(RuntimeError::Native(format!(
+                                "{operation}: {reason}"
+                            )));
                         }
                         InjectionServiceEvent::Stopped => {
-                            return Err(RuntimeError::Native(String::from(
+                            break 'session Err(RuntimeError::Native(String::from(
                                 "Input injection service stopped",
                             )));
                         }
                     }
                 }
             }
+            }
         }
     }
+    .await;
+    sender.close();
+    reader_worker.abort();
+    outcome
 }
 
 async fn apply_agent_actions(
     actions: Vec<AgentAction>,
     injection: &InjectionService,
-    connection: &mut PeerConnection,
+    sender: &mut ControlSender,
 ) -> Result<(), RuntimeError> {
     for action in actions {
         match action {
@@ -816,24 +830,26 @@ async fn apply_agent_actions(
                 .release_all()
                 .map_err(|error| RuntimeError::Native(error.to_string()))?,
             AgentAction::Send(message) => {
-                connection
+                sender
                     .send(message)
                     .await
                     .map_err(|error| RuntimeError::Transport(error.to_string()))?;
             }
             AgentAction::Clipboard(_) => {}
-            AgentAction::CloseConnection => connection.close(),
+            AgentAction::CloseConnection => sender.close(),
         }
     }
     Ok(())
 }
 
 fn spawn_connection_worker(
-    mut connection: PeerConnection,
+    connection: PeerConnection,
     events: tokio_mpsc::Sender<NetworkEvent>,
 ) -> tokio_mpsc::Sender<Session> {
     let peer = connection.info().peer.clone();
     let session_id = connection.info().session_id;
+    let (mut sender, receiver) = connection.split_control();
+    let (mut inbound, reader_worker) = spawn_control_reader(receiver);
     let (outbound, mut outbound_rx) = tokio_mpsc::channel(OUTBOUND_CAPACITY);
     tokio::spawn(async move {
         let reason = loop {
@@ -842,27 +858,29 @@ fn spawn_connection_worker(
                     let Some(message) = message else {
                         break String::from("Connection replaced");
                     };
-                    if let Err(error) = connection.send(message).await {
+                    if let Err(error) = sender.send(message).await {
                         break error.to_string();
                     }
                 }
-                message = connection.receive() => {
-                    match message {
-                        Ok(message) => {
+                inbound_event = inbound.recv() => {
+                    match inbound_event {
+                        Some(ControlReadEvent::Message(message)) => {
                             if events.send(NetworkEvent::Message {
                                 peer: peer.clone(),
                                 session_id,
                                 message,
                             }).await.is_err() {
-                                return;
+                                break String::from("Session runtime stopped");
                             }
                         }
-                        Err(error) => break error.to_string(),
+                        Some(ControlReadEvent::Disconnected(reason)) => break reason,
+                        None => break String::from("Control reader stopped"),
                     }
                 }
             }
         };
-        connection.close();
+        sender.close();
+        reader_worker.abort();
         let _ = events
             .send(NetworkEvent::Disconnected {
                 peer,
@@ -872,6 +890,37 @@ fn spawn_connection_worker(
             .await;
     });
     outbound
+}
+
+fn spawn_control_reader(
+    mut receiver: ControlReceiver,
+) -> (
+    tokio_mpsc::Receiver<ControlReadEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (events_tx, events) = tokio_mpsc::channel(NETWORK_EVENT_CAPACITY);
+    let worker = tokio::spawn(async move {
+        loop {
+            match receiver.receive().await {
+                Ok(message) => {
+                    if events_tx
+                        .send(ControlReadEvent::Message(message))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = events_tx
+                        .send(ControlReadEvent::Disconnected(error.to_string()))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+    (events, worker)
 }
 
 fn capture_edges(topology: &Topology, local_node: &NodeId) -> Vec<Edge> {
@@ -956,6 +1005,11 @@ struct ActivePeer {
     outbound: tokio_mpsc::Sender<Session>,
 }
 
+enum ControlReadEvent {
+    Message(Session),
+    Disconnected(String),
+}
+
 enum NetworkEvent {
     Message {
         peer: NodeId,
@@ -1009,10 +1063,15 @@ mod tests {
 
     use domain::{Edge, NodeId, Point, Rect, ScreenPlacement, Size, Topology};
     use identity::{IdentityStore, LocalIdentity, TrustStore};
+    use protocol::Session;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
     use transport::{SecureClient, SecureServer, SessionLimits};
 
-    use super::{activation_target, capture_edges, session_profile, spawn_accept_worker};
+    use super::{
+        NETWORK_EVENT_CAPACITY, NetworkEvent, activation_target, capture_edges, session_profile,
+        spawn_accept_worker, spawn_connection_worker,
+    };
 
     fn node(value: &str) -> NodeId {
         NodeId::new(value).unwrap_or_else(|error| panic!("invalid test node: {error}"))
@@ -1065,7 +1124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_worker_owns_the_handshake_until_completion() {
+    async fn connection_workers_preserve_bidirectional_control_traffic() {
         let controller_directory =
             TempDir::new().unwrap_or_else(|error| panic!("temp directory failed: {error}"));
         let agent_directory =
@@ -1107,6 +1166,45 @@ mod tests {
 
         assert_eq!(client_connection.info().peer, node("controller"));
         assert_eq!(server_connection.info().peer, node("agent"));
+
+        let (network_tx, mut network_rx) = mpsc::channel(NETWORK_EVENT_CAPACITY);
+        let outbound = spawn_connection_worker(server_connection, network_tx);
+        let (mut agent_sender, mut agent_receiver) = client_connection.split_control();
+        for nonce in 0..64 {
+            outbound
+                .send(Session::Heartbeat { nonce })
+                .await
+                .unwrap_or_else(|error| panic!("outbound queue failed: {error}"));
+        }
+        for expected in 0..64 {
+            let message = tokio::time::timeout(Duration::from_secs(1), agent_receiver.receive())
+                .await
+                .unwrap_or_else(|_| panic!("agent receive timed out"))
+                .unwrap_or_else(|error| panic!("agent receive failed: {error}"));
+            assert!(matches!(
+                message,
+                Session::Heartbeat { nonce } if nonce == expected
+            ));
+            agent_sender
+                .send(Session::HeartbeatAcknowledged { nonce: expected })
+                .await
+                .unwrap_or_else(|error| panic!("acknowledgement failed: {error}"));
+        }
+        for expected in 0..64 {
+            let event = tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("controller receive timed out"))
+                .unwrap_or_else(|| panic!("controller reader stopped"));
+            assert!(matches!(
+                event,
+                NetworkEvent::Message {
+                    message: Session::HeartbeatAcknowledged { nonce },
+                    ..
+                } if nonce == expected
+            ));
+        }
+        agent_sender.close();
+        drop(outbound);
         worker.abort();
     }
 }

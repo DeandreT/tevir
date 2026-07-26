@@ -6,8 +6,8 @@ mod tls;
 
 pub use config::{LimitsError, ReconnectPolicy, SessionLimits};
 pub use endpoint::{
-    ClipboardStream, ConnectionInfo, PeerConnection, SecureClient, SecureServer, SessionProfile,
-    TransportError,
+    ClipboardStream, ConnectionInfo, ControlReceiver, ControlSender, PeerConnection, SecureClient,
+    SecureServer, SessionProfile, TransportError,
 };
 pub use frame::FrameError;
 pub use tls::TlsError;
